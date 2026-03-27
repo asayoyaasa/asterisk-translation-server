@@ -1,0 +1,11 @@
+*.env
+__pycache__/
+*.pyc
+/venv/
+CLAUDE NOT WORK server.py
+halucinateserver.py
+newservernotworking.py
+server2.py
+uuid_fix.py
+v3claudeserver2.py
+work tapi baku server.py
