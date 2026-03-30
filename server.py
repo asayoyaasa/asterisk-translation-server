@@ -191,13 +191,17 @@ async def prewarm_openai_session(src_lang, dst_lang, src_lang_code, ready_event,
             "session": {
                 "modalities": ["audio", "text"],
                 "instructions": build_translation_prompt(src_lang, dst_lang),
-                "voice": "ash",
+                "voice": "verse",
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
                 "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": src_lang_code},
+                # create_response:false — VAD commits the turn but does NOT auto-fire
+                # a response. We manually send response.create with conversation:none
+                # on input_audio_buffer.committed so EVERY utterance is stateless.
                 "turn_detection": {
                     "type": "semantic_vad",
                     "eagerness": "high",
+                    "create_response": False,
                 },
             }
         }))
@@ -260,161 +264,213 @@ LANG_CODES = {
 
 async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, dst_alive_fn, src_lang, dst_lang, speaking_flag, peer_speaking_flag=None, prewarmed_ws=None):
     """
-    Queue-based bridge: utterances that arrive while a translation is playing
-    are buffered and processed in order — nothing is dropped, no overlap.
+    Simultaneous-interpreter bridge.
 
-    Flow per utterance:
-      1. collector task drains src_queue into raw audio chunks
-      2. VAD (semantic_vad, eagerness=high) fires → OpenAI commits the turn
-      3. OpenAI sends back audio → played to dst
-      4. 600ms echo cooldown
-      5. speaking_flag cleared → utterance_done event set
-      6. next queued utterance (if any) is sent immediately
+    chunker() runs two triggers in parallel:
+      - Time trigger:   every CHUNK_SECONDS of continuous speech, force-commit
+      - Clause trigger: commit immediately on clause boundary in partial transcript
+      - Barge-in:       when peer starts speaking, stop + drain the queue
+
+    pipe_out() plays OpenAI audio directly, interruptible frame-by-frame
+    via abort_playback when peer starts speaking (barge-in).
+
+    Result: speaker is at most CHUNK_SECONDS behind, never the full sentence length.
     """
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
     src_lang_code = LANG_CODES.get(src_lang.lower(), None)
 
-    # Queue that holds complete utterance buffers waiting to be translated.
-    # Each item is a list of raw 8kHz PCM chunks captured while the caller spoke.
-    utterance_queue = asyncio.Queue(maxsize=20)  # max 20 buffered utterances
+    CHUNK_SECONDS = 6          # max seconds before force-committing a chunk
+    CLAUSE_CHARS  = 30         # min chars in partial transcript before clause-split allowed
 
-    # Signals that the current translation finished playing + cooldown elapsed
-    utterance_done = asyncio.Event()
-    utterance_done.set()  # start open — first utterance can go immediately
+    # Clause boundary markers — language-agnostic punctuation + common connectives
+    CLAUSE_MARKERS = {',', '.', '!', '?', ';', ':', '،', '。', '、', '！', '？'}
+
+    # Signals pipe_out finished playing + cooldown for current chunk
+    chunk_done = asyncio.Event()
+    chunk_done.set()
+
+    # Shared: partial transcript text from OpenAI delta events (written by pipe_out)
+    partial_transcript = ['']
+
+    # Timestamp of last ASR delta — used for temporal stability in clause trigger
+    last_delta_time = [0.0]
+
+
+    # Signals pipe_out to abort current playback (set on barge-in)
+    abort_playback = asyncio.Event()
+
+    # Set by chunker before manual commit so pipe_out skips its own
+    # response.create on the committed event — prevents double-translation.
+    manual_commit_pending = [False]
 
     async def _run_with_ws(ws):
-        # session.update already sent during prewarm — skip if reusing
+        # Cache once — reused on every response.create throughout the call
+        _prompt = build_translation_prompt(src_lang, dst_lang)
+        _loop = asyncio.get_running_loop()
+
         if prewarmed_ws is None:
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "modalities": ["audio", "text"],
-                    "instructions": build_translation_prompt(src_lang, dst_lang),
-                    "voice": "ash",
+                    "instructions": _prompt,
+                    "voice": "verse",
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",
                     "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": src_lang_code},
-                    # semantic_vad: commits when sentence is linguistically complete,
-                    # not just after a silence window — noticeably lower perceived latency.
-                    # "high" eagerness = cuts in as soon as meaning is clear.
                     "turn_detection": {
                         "type": "semantic_vad",
                         "eagerness": "high",
+                        "create_response": False,
                     },
                 }
             }))
             log.info(f"[{label}] OpenAI ready ({src_lang} → {dst_lang})")
         else:
             log.info(f"[{label}] reusing pre-warmed OpenAI session ({src_lang} → {dst_lang})")
-            # Clear any stale VAD state from idle time, then wait 75ms for
-            # OpenAI to process the clear before we start sending audio
             try:
                 await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
             except: pass
             await asyncio.sleep(0.075)
 
-        # ── collector: captures utterances from the raw audio queue ──────
-        # While a translation is playing (utterance_done not set), audio is
-        # accumulated into a staging buffer.  When VAD silence fires, the
-        # staging buffer is pushed onto utterance_queue as one complete item.
-        # When no translation is playing, audio flows directly to OpenAI.
-        async def collector():
-            staging = []          # accumulates chunks during suppression window
-            was_suppressed = False
+        # ── chunker: collects audio and commits chunks on time/clause/barge-in ──
+        async def chunker():
+            current_chunk = []         # raw PCM chunks for the current window
+            chunk_start_time = None    # when we started collecting this chunk
+            sending_live = False       # True when audio is flowing directly to OpenAI
 
-            while src_alive_fn():
-                try:
-                    audio = await asyncio.wait_for(src_queue.get(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    # If we were collecting and there's been a pause, flush staging
-                    if staging and utterance_done.is_set() and len(staging) > 3:
-                        utterance_queue.put_nowait(staging)
-                        staging = []
-                        was_suppressed = False
-                    continue
-                except Exception as e:
-                    log.error(f"[{label}] collector: {e}")
+            async def _commit_chunk(reason):
+                nonlocal current_chunk, chunk_start_time, sending_live
+                if not current_chunk:
                     return
-
-                suppressed = not utterance_done.is_set()
-
-                if suppressed:
-                    # Translation playing — buffer instead of dropping
-                    staging.append(audio)
-                    was_suppressed = True
-                else:
-                    if was_suppressed and staging:
-                        # Just came out of suppression — push accumulated buffer
-                        # to utterance_queue so sender picks it up immediately
-                        utterance_queue.put_nowait(staging)
-                        staging = []
-                        was_suppressed = False
+                try:
+                    if sending_live:
+                        # Already streaming — just commit what OpenAI has buffered
+                        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                     else:
-                        # Normal path: live speech, send straight to OpenAI
-                        try:
-                            audio24 = resample_up(audio)
+                        # Queued chunk — send + commit in one go
+                        await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                        for raw in current_chunk:
+                            audio24 = resample_up(raw)
                             await ws.send(json.dumps({
                                 "type": "input_audio_buffer.append",
                                 "audio": base64.b64encode(audio24).decode()
                             }))
-                        except Exception as e:
-                            log.error(f"[{label}] collector send: {e}")
-                            return
-
-        # ── sender: drains utterance_queue, replays buffered utterances ──
-        async def sender():
-            while src_alive_fn():
-                try:
-                    chunks = await asyncio.wait_for(utterance_queue.get(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    log.error(f"[{label}] sender: {e}")
-                    return
-
-                # Wait until current translation has finished + cooldown.
-                # 5s safety timeout: if audio.done is never received (network
-                # drop, OpenAI error), sender would stall forever without this.
-                try:
-                    await asyncio.wait_for(utterance_done.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    log.warning(f"[{label}] utterance_done timeout — forcing reset")
-                    utterance_done.set()
-                utterance_done.clear()  # claim the slot
-
-                queued = utterance_queue.qsize()
-                log.info(f"[{label}] replaying queued utterance ({len(chunks)} chunks, {queued} more in queue)")
-
-                # Clear OpenAI's buffer then replay the buffered speech
-                try:
-                    await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-                    for chunk in chunks:
-                        audio24 = resample_up(chunk)
-                        await ws.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": base64.b64encode(audio24).decode()
-                        }))
-                    # Manually commit so VAD doesn't need to re-detect silence
-                    await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    # conversation:none = stateless per-utterance — prevents model from
-                    # using earlier conversation as context and hallucinating extra detail.
+                        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                    # Set BEFORE response.create in both paths so pipe_out skips
+                    # its own response.create on the committed event
+                    manual_commit_pending[0] = True
                     await ws.send(json.dumps({"type": "response.create", "response": {
                         "conversation": "none",
-                        "instructions": build_translation_prompt(src_lang, dst_lang)
+                        "instructions": _prompt
                     }}))
+                    log.info(f"[{label}] chunk committed ({reason}, {len(current_chunk)} frames)")
                 except Exception as e:
-                    log.error(f"[{label}] sender replay: {e}")
-                    utterance_done.set()  # unblock on error
+                    log.error(f"[{label}] commit error: {e}")
+                current_chunk = []
+                chunk_start_time = None
+                partial_transcript[0] = ''
+                sending_live = False
 
-        # ── pipe_out: receives OpenAI events, plays audio to dst ─────────
+            while src_alive_fn():
+                # ── barge-in check ────────────────────────────────────────
+                peer_talking = peer_speaking_flag and peer_speaking_flag[0]
+                if peer_talking:
+                    if current_chunk or sending_live:
+                        log.info(f"[{label}] barge-in — dropping {len(current_chunk)} buffered frames")
+                        current_chunk = []
+                        chunk_start_time = None
+                        partial_transcript[0] = ''
+                        sending_live = False  # must reset so next commit uses correct path
+                        try:
+                            await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                        except: pass
+                    # Signal pipe_out to stop current playback immediately
+                    log.info(f"[{label}] barge-in — interrupting playback")
+                    abort_playback.set()
+                    # Cancel any in-progress OpenAI response immediately.
+                    # Silently ignore response_cancel_not_active — it just means
+                    # no response was running, which is fine.
+                    try:
+                        await ws.send(json.dumps({"type": "response.cancel"}))
+                    except: pass  # response_cancel_not_active is expected here
+                    await asyncio.sleep(0.1)
+                    continue
+
+                abort_playback.clear()
+
+                # ── backlog guard ─────────────────────────────────────────
+                # If the audio queue is dangerously full, the system is lagging.
+                # Reset cleanly rather than produce a corrupted translation.
+                if src_queue.qsize() > 120:
+                    log.warning(f"[{label}] audio backlog too large ({src_queue.qsize()}) — resetting chunk")
+                    current_chunk = []
+                    chunk_start_time = None
+                    partial_transcript[0] = ''
+                    sending_live = False
+                    try:
+                        await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                    except: pass
+                    continue
+
+                # ── read next audio frame ────────────────────────────────
+                try:
+                    audio = await asyncio.wait_for(src_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    # No audio — check if time trigger should fire
+                    if current_chunk and chunk_start_time:
+                        elapsed = _loop.time() - chunk_start_time  # timeout path
+                        if elapsed >= CHUNK_SECONDS:
+                            await _commit_chunk("time")
+                    continue
+                except Exception as e:
+                    log.error(f"[{label}] chunker read: {e}")
+                    return
+
+                # Cache loop time once per iteration — used by both triggers
+                now = _loop.time()
+
+                if not current_chunk:
+                    chunk_start_time = now
+
+                current_chunk.append(audio)
+
+                # Stream live to OpenAI while collecting
+                try:
+                    audio24 = resample_up(audio)
+                    await ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(audio24).decode()
+                    }))
+                    sending_live = True
+                except Exception as e:
+                    log.error(f"[{label}] chunker stream: {e}")
+                    return
+
+                # ── time trigger ─────────────────────────────────────────
+                if chunk_start_time:
+                    elapsed = now - chunk_start_time
+                    if elapsed >= CHUNK_SECONDS:
+                        await _commit_chunk("time")
+                        continue
+
+                # ── clause trigger ────────────────────────────────────────
+                pt = partial_transcript[0]
+                quiet_ms = now - last_delta_time[0]
+                # Require: enough chars + ends with marker + 4+ words +
+                # 400ms of ASR quiet (ensures clause is actually complete,
+                # not just a mid-sentence pause before more words arrive)
+                if (len(pt) >= CLAUSE_CHARS
+                        and pt and pt[-1] in CLAUSE_MARKERS
+                        and pt.count(" ") >= 4
+                        and last_delta_time[0] > 0
+                        and quiet_ms >= 0.4):
+                    await _commit_chunk("clause")
+
+        # ── pipe_out: OpenAI events → audio to dst ───────────────────────
         async def pipe_out():
             import re as _re
             auto_reset_task = None
-
-            # Per-response block flag.
-            # Reset by response.output_item.added at the START of each new response,
-            # NOT by response.audio.done — avoids the race where response B starts
-            # before response A audio.done fires.
             current_response_blocked = False
             response_active = False
             last_original = ""
@@ -424,9 +480,6 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                 return len([p for p in parts if p.strip()])
 
             def length_ratio_ok(src, dst):
-                # Block if translation is suspiciously longer than the original.
-                # Short inputs (< 5 chars) use an absolute cap instead of a ratio
-                # because "Ya" (2 chars) * 3 = 6 would block "Yes, please" (11).
                 if not src or not dst:
                     return True
                 if len(src) < 5:
@@ -434,7 +487,6 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                 return len(dst) <= len(src) * 3
 
             def looks_low_confidence(text):
-                # Block filler noise, partial commits, meaningless fragments.
                 t = text.strip().lower()
                 if len(t) < 2:
                     return True
@@ -465,9 +517,26 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                     etype = event.get("type", "")
 
                     if etype == "response.output_item.added":
-                        # New response starting — reset block flag immediately
                         current_response_blocked = False
                         response_active = True
+
+                    elif etype == "input_audio_buffer.committed":
+                        if manual_commit_pending[0]:
+                            # chunker already sent response.create — skip to avoid duplicate
+                            manual_commit_pending[0] = False
+                        elif not (speaking_flag[0] or (peer_speaking_flag and peer_speaking_flag[0])):
+                            # VAD auto-committed naturally — fire stateless response.create
+                            try:
+                                await ws.send(json.dumps({"type": "response.create", "response": {
+                                    "conversation": "none",
+                                    "instructions": _prompt
+                                }}))
+                            except Exception as e:
+                                log.error(f"[{label}] response.create after commit failed: {e}")
+                        else:
+                            try:
+                                await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                            except: pass
 
                     elif etype == "input_audio_buffer.speech_started":
                         if speaking_flag[0] or (peer_speaking_flag and peer_speaking_flag[0]):
@@ -480,9 +549,16 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                         else:
                             log.info(f"[{label}] speech detected")
 
+                    elif etype == "conversation.item.input_audio_transcription.delta":
+                        # Update shared partial transcript + timestamp for clause trigger
+                        delta = event.get("delta", "")
+                        partial_transcript[0] += delta
+                        last_delta_time[0] = _loop.time()
+
                     elif etype == "conversation.item.input_audio_transcription.completed":
                         last_original = event.get("transcript", "").strip()
                         log.info(f"[{label}] ORIGINAL : {last_original}")
+                        partial_transcript[0] = ''
 
                     elif etype == "response.audio_transcript.done":
                         translated_text = event.get("transcript", "").strip()
@@ -513,7 +589,7 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                                 if auto_reset_task and not auto_reset_task.done():
                                     auto_reset_task.cancel()
                                 speaking_flag[0] = False
-                                utterance_done.set()
+                                chunk_done.set()
                                 try:
                                     if response_active:
                                         await ws.send(json.dumps({"type": "response.cancel"}))
@@ -525,6 +601,16 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
 
                     elif etype == "response.audio.delta":
                         if current_response_blocked:
+                            continue
+                        # Abort mid-playback if barge-in
+                        if abort_playback.is_set():
+                            log.info(f"[{label}] playback aborted (barge-in)")
+                            current_response_blocked = True
+                            try:
+                                if response_active:
+                                    await ws.send(json.dumps({"type": "response.cancel"}))
+                                await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                            except: pass
                             continue
                         chunk = base64.b64decode(event.get("delta", ""))
                         if chunk and dst_alive_fn():
@@ -542,6 +628,9 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                                 try:
                                     frames_sent = 0
                                     for i in range(0, len(audio8), 320):
+                                        # Check barge-in on every frame
+                                        if abort_playback.is_set():
+                                            break
                                         fd = audio8[i:i+320]
                                         if len(fd) < 320:
                                             fd += b"\x00" * (320 - len(fd))
@@ -549,26 +638,26 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                                         await dst_writer.drain()
                                         await asyncio.sleep(0.019)
                                         frames_sent += 1
-                                    for _ in range(3):
-                                        dst_writer.write(build_frame(b"\x00" * 320))
-                                        await dst_writer.drain()
-                                        await asyncio.sleep(0.019)
-                                    log.info(f"[{label}] sent {frames_sent} frames to dst")
+                                    # Only pad if we completed normally (not aborted)
+                                    if not abort_playback.is_set():
+                                        for _ in range(3):
+                                            dst_writer.write(build_frame(b"\x00" * 320))
+                                            await dst_writer.drain()
+                                            await asyncio.sleep(0.019)
+                                    log.debug(f"[{label}] sent {frames_sent} frames to dst")
                                 except Exception as e:
                                     log.error(f"[{label}] audio write failed: {e}")
 
                             async def auto_reset(flag=speaking_flag):
-                                await asyncio.sleep(2.5)
+                                await asyncio.sleep(1.2)
                                 if flag[0]:
-                                    log.warning(f"[{label}] auto-reset speaking_flag after 2.5s timeout")
+                                    log.warning(f"[{label}] auto-reset speaking_flag after 1.2s timeout")
                                     flag[0] = False
-                                    utterance_done.set()
+                                    chunk_done.set()
                             auto_reset_task = asyncio.create_task(auto_reset())
 
                     elif etype == "response.audio.done":
                         response_active = False
-                        # Do NOT reset current_response_blocked here —
-                        # response.output_item.added handles it to avoid timing races
                         if auto_reset_task and not auto_reset_task.done():
                             auto_reset_task.cancel()
                         async def delayed_clear(flag=speaking_flag, lbl=label, _ws=ws):
@@ -577,18 +666,18 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                             except: pass
                             await asyncio.sleep(0.6)
                             flag[0] = False
-                            utterance_done.set()
-                            log.info(f"[{lbl}] audio done → ready for next utterance (after 600ms cooldown)")
+                            chunk_done.set()
+                            log.info(f"[{lbl}] chunk done → ready for next (after 600ms cooldown)")
                         auto_reset_task = asyncio.create_task(delayed_clear())
 
                     elif etype == "error":
                         log.error(f"[{label}] OpenAI error: {event}")
-                        utterance_done.set()
+                        chunk_done.set()
 
                 except Exception as e:
                     log.error(f"[{label}] pipe_out: {e}")
 
-        await asyncio.gather(collector(), sender(), pipe_out())
+        await asyncio.gather(chunker(), pipe_out())
 
     try:
         if prewarmed_ws is not None:
@@ -599,6 +688,8 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                 await _run_with_ws(ws)
     except Exception as e:
         log.error(f"[{label}] bridge error: {e}")
+
+
 
 async def run_bridge(caller_uuid):
     call = calls.get(caller_uuid)
@@ -762,6 +853,14 @@ async def handle_connection(reader, writer):
         stop_ka.set()
         conn["alive"] = False
         ka_task.cancel()
+        # Cancel prewarm tasks if call ended before bridge started
+        # (callee never answered — prewarm would otherwise run indefinitely)
+        if role == "caller":
+            call_entry = calls.get(caller_uuid, {})
+            for task_key in ("prewarm_caller_task", "prewarm_callee_task"):
+                t = call_entry.get(task_key)
+                if t and not t.done():
+                    t.cancel()
 
         # Hang up the other party
         call = calls.get(caller_uuid, {})
