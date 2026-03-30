@@ -185,8 +185,8 @@ def get_language(phone_number: str) -> str:
 if __name__ == "__main__":
     # Quick test
     tests = [
-        ("6281291960446", "Indonesian"),
-        ("15142046067",   "English"),
+        ("62812xxxxxxxx", "Indonesian"),
+        ("151xxxxxxxx",   "English"),
         ("521234567890",  "Spanish"),
         ("4412345678",    "English"),
         ("8613912345678", "Chinese"),
