@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="860" viewBox="0 0 1200 860" role="img" aria-labelledby="title desc">
+  <title id="title">Realtime Translation Flow</title>
+  <desc id="desc">Diagram showing how caller and callee audio move through server.py, OpenAI Realtime, and back to each call leg.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f5f7fb; }
+      .title { font: 700 30px Arial, sans-serif; fill: #14213d; }
+      .subtitle { font: 400 16px Arial, sans-serif; fill: #415a77; }
+      .group { fill: #ffffff; stroke: #b8c4d6; stroke-width: 2; rx: 18; ry: 18; }
+      .box-blue { fill: #dbeafe; stroke: #3b82f6; stroke-width: 2; rx: 14; ry: 14; }
+      .box-green { fill: #dcfce7; stroke: #16a34a; stroke-width: 2; rx: 14; ry: 14; }
+      .box-amber { fill: #fef3c7; stroke: #d97706; stroke-width: 2; rx: 14; ry: 14; }
+      .box-red { fill: #fee2e2; stroke: #dc2626; stroke-width: 2; rx: 14; ry: 14; }
+      .box-slate { fill: #e2e8f0; stroke: #475569; stroke-width: 2; rx: 14; ry: 14; }
+      .label { font: 700 18px Arial, sans-serif; fill: #0f172a; }
+      .text { font: 400 14px Arial, sans-serif; fill: #1e293b; }
+      .small { font: 400 12px Arial, sans-serif; fill: #334155; }
+      .arrow-blue { stroke: #2563eb; stroke-width: 3; fill: none; marker-end: url(#arrowBlue); }
+      .arrow-green { stroke: #16a34a; stroke-width: 3; fill: none; marker-end: url(#arrowGreen); }
+      .arrow-amber { stroke: #d97706; stroke-width: 3; fill: none; marker-end: url(#arrowAmber); }
+      .arrow-red { stroke: #dc2626; stroke-width: 3; fill: none; marker-end: url(#arrowRed); }
+      .arrow-slate { stroke: #475569; stroke-width: 2.5; fill: none; stroke-dasharray: 8 6; marker-end: url(#arrowSlate); }
+    </style>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#16a34a"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#d97706"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/>
+    </marker>
+    <marker id="arrowSlate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1200" height="860"/>
+
+  <text class="title" x="60" y="60">Realtime Phone Translation Flow</text>
+  <text class="subtitle" x="60" y="90">Current production path: only server.py is in the request loop.</text>
+
+  <rect class="group" x="40" y="120" width="1120" height="690"/>
+  <text class="label" x="65" y="155">Call setup, two one-way bridges, and filtered playback</text>
+
+  <rect class="box-blue" x="70" y="200" width="210" height="90"/>
+  <text class="label" x="95" y="235">Caller leg</text>
+  <text class="text" x="95" y="260">AudioSocket audio in</text>
+  <text class="text" x="95" y="282">English source speech</text>
+
+  <rect class="box-green" x="920" y="200" width="210" height="90"/>
+  <text class="label" x="955" y="235">Callee leg</text>
+  <text class="text" x="955" y="260">AudioSocket audio in</text>
+  <text class="text" x="955" y="282">Destination language speech</text>
+
+  <rect class="box-slate" x="360" y="170" width="480" height="150"/>
+  <text class="label" x="390" y="205">server.py call control</text>
+  <text class="text" x="390" y="232">1. Match UUID to /tmp/call_&lt;caller_uuid&gt;.txt</text>
+  <text class="text" x="390" y="255">2. Identify caller vs callee</text>
+  <text class="text" x="390" y="278">3. Start ringback + AMI originate</text>
+  <text class="text" x="390" y="301">4. When both legs connect, run bridge()</text>
+
+  <rect class="box-blue" x="90" y="390" width="420" height="220"/>
+  <text class="label" x="120" y="425">Bridge A: caller to callee</text>
+  <text class="text" x="120" y="452">collector()</text>
+  <text class="small" x="200" y="452">resample 8 kHz to 24 kHz, detect speech, commit turns</text>
+  <text class="text" x="120" y="484">Committed input item</text>
+  <text class="small" x="260" y="484">wait for item_id + transcript for this turn</text>
+  <text class="text" x="120" y="516">response.create</text>
+  <text class="small" x="230" y="516">only after transcript exists for that item</text>
+  <text class="text" x="120" y="548">pipe_out()</text>
+  <text class="small" x="195" y="548">buffer output audio until transcript decision is known</text>
+  <text class="text" x="120" y="580">post_filter()</text>
+  <text class="small" x="210" y="580">drop [SKIP], duplicates, empty, obvious bad output</text>
+
+  <rect class="box-green" x="690" y="390" width="420" height="220"/>
+  <text class="label" x="720" y="425">Bridge B: callee to caller</text>
+  <text class="text" x="720" y="452">collector()</text>
+  <text class="small" x="800" y="452">resample 8 kHz to 24 kHz, detect speech, commit turns</text>
+  <text class="text" x="720" y="484">Committed input item</text>
+  <text class="small" x="860" y="484">wait for item_id + transcript for this turn</text>
+  <text class="text" x="720" y="516">response.create</text>
+  <text class="small" x="830" y="516">only after transcript exists for that item</text>
+  <text class="text" x="720" y="548">pipe_out()</text>
+  <text class="small" x="795" y="548">buffer output audio until transcript decision is known</text>
+  <text class="text" x="720" y="580">post_filter()</text>
+  <text class="small" x="810" y="580">drop [SKIP], duplicates, empty, obvious bad output</text>
+
+  <rect class="box-amber" x="405" y="670" width="390" height="95"/>
+  <text class="label" x="435" y="705">OpenAI Realtime session</text>
+  <text class="text" x="435" y="730">session.update with prompt.md + language pair + whisper hint</text>
+  <text class="text" x="435" y="752">Returns input transcripts, translated text, and translated audio</text>
+
+  <path class="arrow-blue" d="M 280 245 C 315 245, 325 245, 360 245"/>
+  <path class="arrow-green" d="M 920 245 C 885 245, 875 245, 840 245"/>
+
+  <path class="arrow-blue" d="M 175 290 C 175 340, 220 360, 300 390"/>
+  <path class="arrow-green" d="M 1025 290 C 1025 340, 980 360, 900 390"/>
+
+  <path class="arrow-amber" d="M 300 610 C 300 665, 420 665, 500 670"/>
+  <path class="arrow-amber" d="M 900 610 C 900 665, 780 665, 700 670"/>
+
+  <path class="arrow-blue" d="M 500 765 C 500 800, 260 800, 260 620"/>
+  <path class="arrow-green" d="M 700 765 C 700 800, 940 800, 940 620"/>
+
+  <path class="arrow-blue" d="M 260 610 C 260 655, 175 655, 175 290"/>
+  <path class="arrow-green" d="M 940 610 C 940 655, 1025 655, 1025 290"/>
+
+  <path class="arrow-slate" d="M 600 320 L 600 390"/>
+  <text class="small" x="620" y="360">bridge start after both legs are ready</text>
+
+  <rect class="box-red" x="70" y="700" width="250" height="72"/>
+  <text class="label" x="95" y="730">Guardrails</text>
+  <text class="small" x="95" y="752">drop tentative noise, short fragments, empty transcripts</text>
+
+  <rect class="box-red" x="880" y="700" width="250" height="72"/>
+  <text class="label" x="905" y="730">Socket health</text>
+  <text class="small" x="905" y="752">per-leg keepalives + locked writes for AudioSocket traffic</text>
+</svg>

@@ -35,6 +35,10 @@ At a high level, the server:
 
 ## Runtime Architecture
 
+## Translation Flow Diagram
+
+![Realtime translation flow](docs/translation-flow.svg)
+
 ## Call Setup
 
 The server expects Asterisk to create a temporary call record in `/tmp` that contains:
