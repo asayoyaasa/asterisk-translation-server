@@ -1,4 +1,5 @@
 import asyncio, websockets, json, os, base64, logging, glob, struct, uuid as uuid_mod
+from collections import deque
 import soxr
 import numpy as np
 
@@ -28,6 +29,8 @@ HANGUP_FRAME = struct.pack(">BH", MSG_HANGUP, 0)
 SILENCE_THRESHOLD = 300       # mean amplitude threshold for silence
 SILENCE_DURATION_CHUNKS = 12  # ~240ms worth of 20ms chunks (shorter for faster turn detection)
 MIN_AUDIO_CHUNKS = 5         # Realtime API needs at least ~100ms of audio per commit
+MIN_VOICED_CHUNKS = 3        # Require ~60ms of voiced audio before treating noise as speech
+TRANSCRIPT_WAIT_SECONDS = 5.0
 
 def is_silent_chunk(audio, threshold=SILENCE_THRESHOLD):
     """Check if a 20ms audio chunk is silence based on mean amplitude."""
@@ -103,7 +106,7 @@ def generate_ringback():
 RINGBACK_1S = generate_ringback()
 RINGBACK_SILENCE_1S = bytes(16000)  # 1 second silence between rings
 
-async def ringback_loop(writer, stop_event):
+async def ringback_loop(writer, writer_lock, stop_event):
     """Play ringback tone to caller while waiting for callee"""
     ring_audio = RINGBACK_1S + RINGBACK_SILENCE_1S  # 2s: 1s ring + 1s silence
     while not stop_event.is_set():
@@ -114,28 +117,37 @@ async def ringback_loop(writer, stop_event):
             if len(chunk) < 320:
                 chunk += b"\x00" * (320 - len(chunk))
             try:
-                writer.write(build_frame(chunk))
-                await writer.drain()
+                async with writer_lock:
+                    writer.write(build_frame(chunk))
+                    await writer.drain()
             except:
                 return
             await asyncio.sleep(0.018)
 
-async def keepalive(writer, stop_event):
+async def keepalive(writer, writer_lock, stop_event):
     while not stop_event.is_set():
-        try: writer.write(SILENCE); await writer.drain()
+        try:
+            async with writer_lock:
+                writer.write(SILENCE)
+                await writer.drain()
         except: break
         await asyncio.sleep(0.5)
 
-async def read_frame(reader):
-    h = await asyncio.wait_for(reader.readexactly(3), timeout=60)
+async def read_frame(reader, timeout=None):
+    h = await asyncio.wait_for(reader.readexactly(3), timeout=timeout)
     t, l = struct.unpack(">BH", h)
     p = await reader.readexactly(l) if l > 0 else b""
     return t, p
 
-async def send_hangup(writer):
+async def send_hangup(writer, writer_lock=None):
     try:
-        writer.write(HANGUP_FRAME)
-        await writer.drain()
+        if writer_lock:
+            async with writer_lock:
+                writer.write(HANGUP_FRAME)
+                await writer.drain()
+        else:
+            writer.write(HANGUP_FRAME)
+            await writer.drain()
     except: pass
 
 # ISO 639-1 codes for Whisper language hint — covers all languages in languages.py
@@ -321,17 +333,23 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
         async with websockets.connect(OPENAI_WS_URL, additional_headers=headers) as ws:
             response_active = asyncio.Event()
             response_active.set()
-            input_transcript_ready = asyncio.Event()
             response_create_lock = asyncio.Lock()
             pending_item_ids = []
             last_original_text = [""]
+            committed_input_items = deque()
+            committed_input_item_ready = asyncio.Event()
+            transcripts_by_item = {}
+            transcript_waiters = {}
 
-            async def delete_pending_items(reason: str):
-                if not pending_item_ids:
+            async def delete_item_ids(item_ids, reason: str):
+                if not item_ids:
                     return
-                items_to_delete = list(dict.fromkeys(pending_item_ids))
-                pending_item_ids.clear()
+                items_to_delete = list(dict.fromkeys(item_ids))
                 for item_id in items_to_delete:
+                    try:
+                        pending_item_ids.remove(item_id)
+                    except ValueError:
+                        pass
                     try:
                         await ws.send(json.dumps({
                             "type": "conversation.item.delete",
@@ -341,15 +359,53 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                         pass
                 log.info(f"[{label}] deleted {len(items_to_delete)} conversation items ({reason})")
 
+            async def delete_pending_items(reason: str):
+                await delete_item_ids(list(pending_item_ids), reason)
+
+            async def wait_for_next_committed_item(timeout: float = 1.0):
+                if committed_input_items:
+                    return committed_input_items.popleft()
+                committed_input_item_ready.clear()
+                await asyncio.wait_for(committed_input_item_ready.wait(), timeout=timeout)
+                item_id = committed_input_items.popleft()
+                if not committed_input_items:
+                    committed_input_item_ready.clear()
+                return item_id
+
+            async def wait_for_transcript(item_id: str, timeout: float) -> str:
+                if item_id in transcripts_by_item:
+                    return transcripts_by_item[item_id]
+                waiter = transcript_waiters.get(item_id)
+                if waiter is None:
+                    waiter = asyncio.Event()
+                    transcript_waiters[item_id] = waiter
+                await asyncio.wait_for(waiter.wait(), timeout=timeout)
+                return transcripts_by_item.get(item_id, "")
+
             async def create_response(trigger: str) -> bool:
                 try:
-                    await asyncio.wait_for(input_transcript_ready.wait(), timeout=1.5)
+                    item_id = await wait_for_next_committed_item()
+                except asyncio.TimeoutError:
+                    log.warning(f"[{label}] committed item timeout after {trigger}")
+                    return False
+
+                try:
+                    src_text = (await wait_for_transcript(item_id, TRANSCRIPT_WAIT_SECONDS)).strip()
                 except asyncio.TimeoutError:
                     log.warning(f"[{label}] transcript timeout after {trigger}")
+                    await delete_item_ids([item_id], "transcript timeout")
+                    last_original_text[0] = ""
+                    transcript_waiters.pop(item_id, None)
+                    transcripts_by_item.pop(item_id, None)
+                    return False
 
-                if not last_original_text[0].strip():
+                transcript_waiters.pop(item_id, None)
+                transcripts_by_item.pop(item_id, None)
+                last_original_text[0] = src_text
+
+                if not src_text:
                     log.warning(f"[{label}] dropping utterance with empty transcript after {trigger}")
-                    await delete_pending_items("empty transcript")
+                    await delete_item_ids([item_id], "empty transcript")
                     return False
 
                 async with response_create_lock:
@@ -378,7 +434,8 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                     "modalities": ["audio", "text"],
                     "instructions": get_prompt(src_lang, dst_lang),
                     "voice": "marin",
-                    "temperature": 0.2,
+                    "temperature": 0.6,
+                    "turn_detection": None,
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",
                     "input_audio_transcription": {"model": "whisper-1", "language": src_lang_code},
@@ -397,9 +454,11 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                 staging = []
                 silent_count = 0
                 has_speech = False
+                staging_voiced_chunks = 0
 
                 vadsilent_count = 0
                 pending_audio_chunks = 0
+                voiced_audio_chunks = 0
                 last_audio_time = asyncio.get_event_loop().time()
                 while src_alive_fn():
                     try:
@@ -412,13 +471,13 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                             queue_utterance(trimmed, "flush on timeout")
                             staging = []
                             has_speech = False
+                            staging_voiced_chunks = 0
                             silent_count = 0
                         # Timeout commit for live speech
                         now = asyncio.get_event_loop().time()
                         if has_speech and now - last_audio_time > 1.0 and pending_audio_chunks >= MIN_AUDIO_CHUNKS:
                             try:
                                 last_original_text[0] = ""
-                                input_transcript_ready.clear()
                                 await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                                 log.info(f"[{label}] timeout commit after {now - last_audio_time:.1f}s")
                                 await create_response("timeout commit")
@@ -426,6 +485,7 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                                 log.warning(f"[{label}] timeout commit failed: {e}")
                             vadsilent_count = 0
                             has_speech = False
+                            voiced_audio_chunks = 0
                             pending_audio_chunks = 0
                         continue
                     except Exception as e:
@@ -446,10 +506,13 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                                 queue_utterance(trimmed, "segmented while suppressed")
                                 staging = []
                                 has_speech = False
+                                staging_voiced_chunks = 0
                                 silent_count = 0
                         else:
                             silent_count = 0
-                            has_speech = True
+                            staging_voiced_chunks += 1
+                            if staging_voiced_chunks >= MIN_VOICED_CHUNKS:
+                                has_speech = True
                     else:
                         # Not suppressed — flush any leftover staging first
                         if staging and has_speech:
@@ -457,14 +520,17 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                             queue_utterance(trimmed, "flush after suppression")
                             staging = []
                             has_speech = False
+                            staging_voiced_chunks = 0
                             silent_count = 0
                         elif staging:
                             # Had staging but no speech (just silence) — discard
                             staging = []
+                            staging_voiced_chunks = 0
                             silent_count = 0
 
                         # Normal path: live speech, send straight to OpenAI
                         try:
+                            silent = is_silent_chunk(audio)
                             audio24 = resample_up(audio)
                             await ws.send(json.dumps({
                                 "type": "input_audio_buffer.append",
@@ -472,17 +538,36 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                             }))
 
                             pending_audio_chunks += 1
-                            if not is_silent_chunk(audio):
-                                has_speech = True
-                                vadsilent_count = 0
+                            if not silent:
+                                voiced_audio_chunks += 1
+                                if voiced_audio_chunks >= MIN_VOICED_CHUNKS and not has_speech:
+                                    log.info(f"[{label}] speech detected")
+                                    has_speech = True
+                                if voiced_audio_chunks >= MIN_VOICED_CHUNKS:
+                                    vadsilent_count = 0
                             else:
-                                vadsilent_count += 1
+                                if voiced_audio_chunks > 0:
+                                    vadsilent_count += 1
+
+                            # If we only caught a tiny noise burst and then silence,
+                            # clear it before it turns into an empty commit.
+                            if (not has_speech and voiced_audio_chunks > 0
+                                    and vadsilent_count >= SILENCE_DURATION_CHUNKS):
+                                log.info(f"[{label}] dropped tentative speech ({voiced_audio_chunks} voiced chunks)")
+                                try:
+                                    await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                                except:
+                                    pass
+                                vadsilent_count = 0
+                                voiced_audio_chunks = 0
+                                pending_audio_chunks = 0
+                                last_original_text[0] = ""
+                                continue
 
                             # Commit only after speech has been observed, with at least 100ms of audio
                             if has_speech and pending_audio_chunks >= MIN_AUDIO_CHUNKS and vadsilent_count >= SILENCE_DURATION_CHUNKS:
                                 try:
                                     last_original_text[0] = ""
-                                    input_transcript_ready.clear()
                                     await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                                     log.info(f"[{label}] local silence commit: {vadsilent_count} silent chunks (buf {pending_audio_chunks} chunks)")
                                     await create_response("local silence commit")
@@ -490,6 +575,7 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                                     log.warning(f"[{label}] local commit failed: {e}")
                                 vadsilent_count = 0
                                 has_speech = False
+                                voiced_audio_chunks = 0
                                 pending_audio_chunks = 0
 
                         except Exception as e:
@@ -526,7 +612,6 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                             }))
                         # Manually commit so VAD doesn't need to re-detect silence
                         last_original_text[0] = ""
-                        input_transcript_ready.clear()
                         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                         created = await create_response("queued replay")
                         if not created:
@@ -538,6 +623,108 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
             # ── pipe_out: receives OpenAI events, plays audio to dst ─────────
             async def pipe_out():
                 auto_reset_task = None
+                response_done_fallback_task = None
+                response_audio_seen = [False]
+                transcript_decided = asyncio.Event()
+                current_response_blocked = [True]
+                current_response_reason = [""]
+                pending_audio_chunks = []
+                response_audio_done_seen = [False]
+                response_done_seen = [False]
+                response_finalized = [False]
+                response_finish_task = None
+
+                async def play_buffered_audio():
+                    if not pending_audio_chunks or not dst_alive_fn():
+                        return 0
+                    frames_sent = 0
+                    async with dst_lock:
+                        try:
+                            for chunk24 in pending_audio_chunks:
+                                audio8 = resample_down(chunk24)
+                                for i in range(0, len(audio8), 320):
+                                    fd = audio8[i:i+320]
+                                    if len(fd) < 320:
+                                        fd += b"\x00" * (320 - len(fd))
+                                    dst_writer.write(build_frame(fd))
+                                    await dst_writer.drain()
+                                    await asyncio.sleep(0.019)
+                                    frames_sent += 1
+                            for _ in range(3):
+                                dst_writer.write(build_frame(b"\x00" * 320))
+                                await dst_writer.drain()
+                                await asyncio.sleep(0.019)
+                        except Exception as e:
+                            log.error(f"[{label}] audio write failed: {e}")
+                    pending_audio_chunks.clear()
+                    return frames_sent
+
+                async def finalize_response(no_audio: bool = False):
+                    nonlocal auto_reset_task, response_done_fallback_task, response_finish_task
+                    if response_finalized[0]:
+                        return
+                    response_finalized[0] = True
+
+                    if auto_reset_task and not auto_reset_task.done():
+                        auto_reset_task.cancel()
+                    if response_done_fallback_task and not response_done_fallback_task.done():
+                        response_done_fallback_task.cancel()
+                    if response_finish_task and not response_finish_task.done():
+                        response_finish_task.cancel()
+
+                    items_to_delete = list(pending_item_ids)
+                    pending_item_ids.clear()
+
+                    if (not no_audio
+                            and not current_response_blocked[0]
+                            and pending_audio_chunks
+                            and dst_alive_fn()):
+                        speaking_flag[0] = True
+                        frames_sent = await play_buffered_audio()
+                        log.info(f"[{label}] sent {frames_sent} frames to dst")
+                    else:
+                        pending_audio_chunks.clear()
+                        speaking_flag[0] = False
+
+                    response_active.set()
+
+                    async def delayed_clear(flag=speaking_flag, lbl=label, _ws=ws, _items=items_to_delete):
+                        try:
+                            await _ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                        except:
+                            pass
+
+                        if _items:
+                            pending_item_ids[:0] = _items
+                            await delete_pending_items("response audio done")
+
+                        await asyncio.sleep(0.55)
+                        flag[0] = False
+                        utterance_done.set()
+                        log.info(f"[{lbl}] audio done → ready for next utterance (after 550ms cooldown)")
+
+                    auto_reset_task = asyncio.create_task(delayed_clear())
+
+                async def maybe_finalize_response():
+                    if response_finalized[0]:
+                        return
+                    if response_audio_done_seen[0] and transcript_decided.is_set():
+                        await finalize_response(no_audio=False)
+                    elif response_done_seen[0] and not pending_audio_chunks and transcript_decided.is_set():
+                        await finalize_response(no_audio=True)
+
+                async def finish_after_timeout():
+                    try:
+                        await asyncio.sleep(2.5)
+                        if response_finalized[0]:
+                            return
+                        if not transcript_decided.is_set():
+                            current_response_blocked[0] = True
+                            current_response_reason[0] = "undecided"
+                            log.warning(f"[{label}] transcript decision still missing; dropping buffered audio")
+                        await finalize_response(no_audio=not pending_audio_chunks)
+                    except asyncio.CancelledError:
+                        pass
 
                 async for msg in ws:
                     try:
@@ -568,10 +755,21 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                             if item_id:
                                 pending_item_ids.append(item_id)
 
+                        elif etype == "input_audio_buffer.committed":
+                            item_id = event.get("item_id")
+                            if item_id:
+                                committed_input_items.append(item_id)
+                                committed_input_item_ready.set()
+
                         elif etype == "conversation.item.input_audio_transcription.completed":
+                            item_id = event.get("item_id")
                             src_text = event.get('transcript','').strip()
+                            if item_id:
+                                transcripts_by_item[item_id] = src_text
+                                waiter = transcript_waiters.get(item_id)
+                                if waiter:
+                                    waiter.set()
                             last_original_text[0] = src_text
-                            input_transcript_ready.set()
                             log.info(f"[{label}] ORIGINAL : {src_text}")
 
                         elif etype == "response.audio_transcript.done":
@@ -579,6 +777,9 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                             now = asyncio.get_event_loop().time()
                             original = last_original_text[0]
                             blocked, reason = post_filter(text, original, now, last_tx_text, last_tx_time)
+                            current_response_blocked[0] = blocked
+                            current_response_reason[0] = reason
+                            transcript_decided.set()
                             if blocked:
                                 log.warning(f"[{label}] FILTERED [{reason}]: {text!r}")
                                 metrics.filtered += 1
@@ -586,11 +787,24 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                                 log.info(f"[{label}] TRANSLATED: {text}")
                                 last_tx_text[0] = text
                                 last_tx_time[0] = now
+                            await maybe_finalize_response()
 
                         elif etype == "response.audio_transcript.delta":
                             pass
 
                         elif etype == "response.created":
+                            response_audio_seen[0] = False
+                            response_audio_done_seen[0] = False
+                            response_done_seen[0] = False
+                            response_finalized[0] = False
+                            current_response_blocked[0] = True
+                            current_response_reason[0] = "pending"
+                            transcript_decided.clear()
+                            pending_audio_chunks.clear()
+                            if response_done_fallback_task and not response_done_fallback_task.done():
+                                response_done_fallback_task.cancel()
+                            if response_finish_task and not response_finish_task.done():
+                                response_finish_task.cancel()
                             # FIX: suppress collector EARLY — as soon as OpenAI
                             # starts generating a response, switch to staging so
                             # no new audio leaks into the input buffer and gets
@@ -604,88 +818,37 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                         elif etype == "response.audio.delta":
                             chunk = base64.b64decode(event.get("delta", ""))
                             if chunk and dst_alive_fn():
-                                if not speaking_flag[0]:
-                                    speaking_flag[0] = True
-                                    # utterance_done already cleared by
-                                    # response.created, but clear again as
-                                    # safety net in case it was missed
-                                    utterance_done.clear()
-                                    try:
-                                        await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-                                    except: pass
-
-                                if auto_reset_task and not auto_reset_task.done():
-                                    auto_reset_task.cancel()
-
-                                audio8 = resample_down(chunk)
-                                async with dst_lock:
-                                    try:
-                                        frames_sent = 0
-                                        for i in range(0, len(audio8), 320):
-                                            fd = audio8[i:i+320]
-                                            if len(fd) < 320:
-                                                fd += b"\x00" * (320 - len(fd))
-                                            dst_writer.write(build_frame(fd))
-                                            await dst_writer.drain()
-                                            await asyncio.sleep(0.019)
-                                            frames_sent += 1
-                                        for _ in range(3):
-                                            dst_writer.write(build_frame(b"\x00" * 320))
-                                            await dst_writer.drain()
-                                            await asyncio.sleep(0.019)
-                                        log.info(f"[{label}] sent {frames_sent} frames to dst")
-                                    except Exception as e:
-                                        log.error(f"[{label}] audio write failed: {e}")
-
-                                async def auto_reset(flag=speaking_flag):
-                                    await asyncio.sleep(2.0)
-                                    if flag[0]:
-                                        log.warning(f"[{label}] auto-reset speaking_flag after 2s timeout")
-                                        flag[0] = False
-                                        utterance_done.set()
-                                auto_reset_task = asyncio.create_task(auto_reset())
+                                response_audio_seen[0] = True
+                                if response_done_fallback_task and not response_done_fallback_task.done():
+                                    response_done_fallback_task.cancel()
+                                pending_audio_chunks.append(chunk)
 
                         elif etype == "response.audio.done":
-                            if auto_reset_task and not auto_reset_task.done():
-                                auto_reset_task.cancel()
-
-                            # Capture item IDs for deletion inside the closure
-                            items_to_delete = list(pending_item_ids)
-                            pending_item_ids.clear()
-
-                            # Immediately allow collector to resume through suppressed path
-                            speaking_flag[0] = False
-                            response_active.set()
-
-                            async def delayed_clear(flag=speaking_flag, lbl=label, _ws=ws, _items=items_to_delete):
-                                try:
-                                    await _ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-                                except: pass
-
-                                # Delete all conversation items from this
-                                # exchange so the model cannot use prior
-                                # context to hallucinate on the next utterance
-                                if _items:
-                                    pending_item_ids[:0] = _items
-                                    await delete_pending_items("response audio done")
-
-                                await asyncio.sleep(0.55)
-                                flag[0] = False
-                                utterance_done.set()  # unblocks sender for next queued utterance
-                                log.info(f"[{lbl}] audio done → ready for next utterance (after 550ms cooldown)")
-                            auto_reset_task = asyncio.create_task(delayed_clear())
+                            response_audio_seen[0] = True
+                            response_audio_done_seen[0] = True
+                            if response_finish_task and not response_finish_task.done():
+                                response_finish_task.cancel()
+                            response_finish_task = asyncio.create_task(finish_after_timeout())
+                            await maybe_finalize_response()
 
                         elif etype == "response.done":
-                            # Safety net: if response.audio.done was missed
-                            # (e.g. text-only response or cancelled response),
-                            # clean up conversation items and unblock
-                            if pending_item_ids:
-                                await delete_pending_items("response.done fallback")
-                            response_active.set()
-                            # Ensure speaking flag is reset and queue can progress
-                            speaking_flag[0] = False
-                            if not utterance_done.is_set():
-                                utterance_done.set()
+                            response_done_seen[0] = True
+                            if response_done_fallback_task and not response_done_fallback_task.done():
+                                response_done_fallback_task.cancel()
+                            async def delayed_response_done_fallback():
+                                nonlocal response_finish_task
+                                try:
+                                    await asyncio.sleep(0.4)
+                                    await maybe_finalize_response()
+                                    if response_finalized[0]:
+                                        return
+                                    if response_finish_task and not response_finish_task.done():
+                                        response_finish_task.cancel()
+                                    response_finish_task = asyncio.create_task(finish_after_timeout())
+                                except asyncio.CancelledError:
+                                    pass
+
+                            response_done_fallback_task = asyncio.create_task(delayed_response_done_fallback())
 
                         elif etype == "error":
                             err = event.get("error", {})
@@ -721,21 +884,19 @@ async def run_bridge(caller_uuid):
     lang = call["lang"]
     log.info(f"=== BRIDGE ACTIVE EN <-> {lang} ===")
 
-    caller_lock = asyncio.Lock()
-    callee_lock = asyncio.Lock()
+    caller_lock = ci["lock"]
+    callee_lock = ce["lock"]
     callee_speaking = [False]
     caller_speaking = [False]
 
-    async def keepalive_both():
-        while ci.get("alive") or ce.get("alive"):
-            if ci.get("alive"):
-                async with caller_lock:
-                    try: ci["writer"].write(SILENCE); await ci["writer"].drain()
-                    except: pass
-            if ce.get("alive"):
-                async with callee_lock:
-                    try: ce["writer"].write(SILENCE); await ce["writer"].drain()
-                    except: pass
+    async def keepalive_leg(conn, writer_lock):
+        while conn.get("alive"):
+            try:
+                async with writer_lock:
+                    conn["writer"].write(SILENCE)
+                    await conn["writer"].drain()
+            except:
+                return
             await asyncio.sleep(0.5)
 
     await asyncio.gather(
@@ -745,14 +906,15 @@ async def run_bridge(caller_uuid):
         one_way_bridge("callee→caller", ce["queue"], ci["writer"], caller_lock,
                        lambda: ce.get("alive", False), lambda: ci.get("alive", False),
                        lang, "English", caller_speaking, callee_speaking),
-        keepalive_both()
+        keepalive_leg(ci, caller_lock),
+        keepalive_leg(ce, callee_lock),
     )
 
 async def handle_connection(reader, writer):
     peer = writer.get_extra_info("peername")
     log.info(f"New connection from {peer}")
     try:
-        t, p = await asyncio.wait_for(read_frame(reader), timeout=10)
+        t, p = await read_frame(reader, timeout=10)
         if t != MSG_UUID: writer.close(); return
         uuid = parse_uuid(p)
         log.info(f"UUID: {uuid}")
@@ -768,8 +930,9 @@ async def handle_connection(reader, writer):
     log.info(f"Role: {role} | Dest: {dest} | Lang: {lang} | CID: {cid}")
 
     queue = asyncio.Queue()
+    writer_lock = asyncio.Lock()
     stop_ka = asyncio.Event()
-    conn = {"queue": queue, "writer": writer, "alive": True}
+    conn = {"queue": queue, "writer": writer, "lock": writer_lock, "alive": True}
 
     # setdefault: never overwrite existing entry (fixes race where callee
     # arrives before caller and caller's init would wipe the callee conn)
@@ -779,9 +942,9 @@ async def handle_connection(reader, writer):
     if role == "caller":
         log.info(f"Caller connected - playing ringback, originating to {dest}")
         asyncio.create_task(ami_originate(callee_uuid, dest, cid))
-        ka_task = asyncio.create_task(ringback_loop(writer, stop_ka))
+        ka_task = asyncio.create_task(ringback_loop(writer, writer_lock, stop_ka))
     else:
-        ka_task = asyncio.create_task(keepalive(writer, stop_ka))
+        ka_task = asyncio.create_task(keepalive(writer, writer_lock, stop_ka))
 
     # Store stop event BEFORE bridge check so the other side can always find it
     conn["stop_ka_event"] = stop_ka
@@ -794,6 +957,9 @@ async def handle_connection(reader, writer):
             caller_stop = caller_conn.get("stop_ka_event")
             if caller_stop:
                 caller_stop.set()
+            callee_stop = conn.get("stop_ka_event")
+            if callee_stop:
+                callee_stop.set()
             asyncio.create_task(run_bridge(caller_uuid))
         else:
             log.info("Callee arrived before caller - waiting")
@@ -803,11 +969,14 @@ async def handle_connection(reader, writer):
         if calls[caller_uuid]["callee"]:
             log.info("Both legs ready - starting bridge (caller arrived second)")
             stop_ka.set()  # stop ringback immediately
+            callee_stop = calls[caller_uuid]["callee"].get("stop_ka_event")
+            if callee_stop:
+                callee_stop.set()
             asyncio.create_task(run_bridge(caller_uuid))
 
     try:
         while True:
-            t, p = await read_frame(reader)
+            t, p = await read_frame(reader, timeout=None)
             if t == MSG_HANGUP:
                 log.info(f"{role} hung up")
                 break
@@ -827,7 +996,7 @@ async def handle_connection(reader, writer):
         if other and other.get("alive"):
             log.info(f"{role} disconnected - hanging up {other_role}")
             other["alive"] = False
-            await send_hangup(other["writer"])
+            await send_hangup(other["writer"], other.get("lock"))
             try: other["writer"].close()
             except: pass
 

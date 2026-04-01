@@ -27,13 +27,11 @@ At a high level, the server:
 ## Repository Files
 
 - `server.py`
-  The main production server. Handles call setup, AMI origination, OpenAI sessions, audio bridging, filtering, cleanup, and metrics.
+  The only supported runtime entrypoint. Handles call setup, AMI origination, OpenAI sessions, audio bridging, filtering, cleanup, and metrics.
 - `prompt.md`
   The system prompt template used for translation. It tells the model to translate literally, treat each utterance independently, and output `[SKIP]` instead of inventing speech.
 - `languages.py`
   Maps E.164 country codes to a spoken language name. This is how the destination language is chosen.
-- `server3.py`, `server4.py`, `hermesv1.py`, and other similarly named files
-  Experimental or alternate versions in the repo. They are not part of the focused commit for the current production path.
 
 ## Runtime Architecture
 
@@ -63,11 +61,12 @@ Callee flow:
 
 ## Bridge Model
 
-`run_bridge()` launches three coroutines together:
+`run_bridge()` launches four coroutines together:
 
 - one `one_way_bridge()` for `caller -> callee`
 - one `one_way_bridge()` for `callee -> caller`
-- one keepalive loop that periodically sends silence to both legs
+- one keepalive loop for the caller leg
+- one keepalive loop for the callee leg
 
 Each `one_way_bridge()` owns one OpenAI realtime session and one direction of translation.
 
@@ -125,7 +124,7 @@ Queued utterances shorter than `MIN_AUDIO_CHUNKS` are dropped before replay. Thi
 
 ### 3. Transcript-gated response creation
 
-Before `response.create` is sent, the bridge briefly waits for `conversation.item.input_audio_transcription.completed`. If no usable transcript appears, that utterance is dropped instead of asking the model to improvise.
+Before `response.create` is sent, the bridge waits for the committed input item and then for that specific item's `conversation.item.input_audio_transcription.completed` event. If no usable transcript appears, that utterance is dropped instead of asking the model to improvise.
 
 ### 4. Post-filtering
 
@@ -301,7 +300,6 @@ The active implementation in `server.py` assumes:
 - Some recovery logic still depends on event ordering from the Realtime API.
 - Post-filtering happens after transcript events, so it reduces bad output a lot but cannot guarantee zero audible hallucinations in every edge case.
 - Credentials and several deployment settings are still hard-coded in `server.py`.
-- The repo contains multiple experimental server variants, which can make maintenance confusing if they drift too far from the production file.
 
 ## Recommended Next Improvements
 
