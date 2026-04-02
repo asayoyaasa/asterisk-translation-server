@@ -1,5 +1,6 @@
 import asyncio, websockets, json, os, base64, logging, glob, struct, uuid as uuid_mod
 from collections import deque
+from datetime import datetime, timezone
 import soxr
 import numpy as np
 
@@ -212,6 +213,30 @@ def get_prompt(src_lang: str, dst_lang: str) -> str:
 
 BASE_PROMPT = load_base_prompt()
 
+# ── Dashboard event stream ───────────────────────────────────────────────────
+
+DASHBOARD_EVENT_LOG = os.environ.get(
+    "TRANSLATION_DASHBOARD_EVENT_LOG",
+    "/opt/voipagent-translate/data/translation-events.jsonl",
+)
+
+def _dashboard_ts() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def emit_dashboard_event(event_type: str, **payload):
+    """Append structured dashboard events without affecting the live bridge."""
+    try:
+        if not DASHBOARD_EVENT_LOG:
+            return
+        event = {"type": event_type, "ts": _dashboard_ts(), **payload}
+        parent = os.path.dirname(DASHBOARD_EVENT_LOG)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(DASHBOARD_EVENT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning(f"dashboard event write failed: {e}")
+
 # ── Metrics ──────────────────────────────────────────────────────────────────
 
 class Metrics:
@@ -297,7 +322,7 @@ def post_filter(text: str, original: str, now: float, last_tx_text_ref, last_tx_
         return True, "duplicate"
     return False, ""
 
-async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, dst_alive_fn, src_lang, dst_lang, speaking_flag, peer_speaking_flag=None):
+async def one_way_bridge(label, call_id, cid, dest, src_queue, dst_writer, dst_lock, src_alive_fn, dst_alive_fn, src_lang, dst_lang, speaking_flag, peer_speaking_flag=None):
     """
     Queue-based bridge with continuous speech support.
 
@@ -320,6 +345,7 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
     src_lang_code = LANG_CODES.get(src_lang.lower(), None)
     last_tx_text = [""]
     last_tx_time = [0.0]
+    direction_key = "caller_to_callee" if label == "caller→callee" else "callee_to_caller"
 
     # Queue that holds complete utterance buffers waiting to be translated.
     # Each item is a list of raw 8kHz PCM chunks captured while the caller spoke.
@@ -633,6 +659,9 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                 response_done_seen = [False]
                 response_finalized = [False]
                 response_finish_task = None
+                response_serial = 0
+                current_response_id = [None]
+                current_response_text = [""]
 
                 async def play_buffered_audio():
                     if not pending_audio_chunks or not dst_alive_fn():
@@ -682,6 +711,19 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                         speaking_flag[0] = True
                         frames_sent = await play_buffered_audio()
                         log.info(f"[{label}] sent {frames_sent} frames to dst")
+                        if current_response_id[0] and current_response_text[0] and frames_sent > 0:
+                            emit_dashboard_event(
+                                "utterance.playback",
+                                callId=call_id,
+                                cid=cid,
+                                dest=dest,
+                                direction=label,
+                                srcLang=src_lang,
+                                dstLang=dst_lang,
+                                responseId=current_response_id[0],
+                                text=current_response_text[0],
+                                playbackMs=frames_sent * 20,
+                            )
                     else:
                         pending_audio_chunks.clear()
                         speaking_flag[0] = False
@@ -771,6 +813,17 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                                     waiter.set()
                             last_original_text[0] = src_text
                             log.info(f"[{label}] ORIGINAL : {src_text}")
+                            if src_text:
+                                emit_dashboard_event(
+                                    "utterance.original",
+                                    callId=call_id,
+                                    cid=cid,
+                                    dest=dest,
+                                    direction=label,
+                                    srcLang=src_lang,
+                                    dstLang=dst_lang,
+                                    text=src_text,
+                                )
 
                         elif etype == "response.audio_transcript.done":
                             text = event.get('transcript', '').strip()
@@ -781,18 +834,48 @@ async def one_way_bridge(label, src_queue, dst_writer, dst_lock, src_alive_fn, d
                             current_response_reason[0] = reason
                             transcript_decided.set()
                             if blocked:
+                                current_response_text[0] = ""
                                 log.warning(f"[{label}] FILTERED [{reason}]: {text!r}")
                                 metrics.filtered += 1
+                                emit_dashboard_event(
+                                    "utterance.filtered",
+                                    callId=call_id,
+                                    cid=cid,
+                                    dest=dest,
+                                    direction=label,
+                                    srcLang=src_lang,
+                                    dstLang=dst_lang,
+                                    responseId=current_response_id[0],
+                                    text=text,
+                                    reason=reason,
+                                    original=original,
+                                )
                             else:
+                                current_response_text[0] = text
                                 log.info(f"[{label}] TRANSLATED: {text}")
                                 last_tx_text[0] = text
                                 last_tx_time[0] = now
+                                emit_dashboard_event(
+                                    "utterance.translated",
+                                    callId=call_id,
+                                    cid=cid,
+                                    dest=dest,
+                                    direction=label,
+                                    srcLang=src_lang,
+                                    dstLang=dst_lang,
+                                    responseId=current_response_id[0],
+                                    text=text,
+                                    original=original,
+                                )
                             await maybe_finalize_response()
 
                         elif etype == "response.audio_transcript.delta":
                             pass
 
                         elif etype == "response.created":
+                            response_serial += 1
+                            current_response_id[0] = f"{call_id}:{direction_key}:{response_serial}"
+                            current_response_text[0] = ""
                             response_audio_seen[0] = False
                             response_audio_done_seen[0] = False
                             response_done_seen[0] = False
@@ -882,7 +965,18 @@ async def run_bridge(caller_uuid):
     if not ci or not ce: log.error("Bridge aborted - missing legs"); return
 
     lang = call["lang"]
+    cid = call.get("cid", "")
+    dest = call.get("dest", "")
     log.info(f"=== BRIDGE ACTIVE EN <-> {lang} ===")
+    emit_dashboard_event(
+        "call.ready",
+        callId=caller_uuid,
+        callerUuid=call.get("caller_uuid", caller_uuid),
+        calleeUuid=call.get("callee_uuid", ""),
+        cid=cid,
+        dest=dest,
+        lang=lang,
+    )
 
     caller_lock = ci["lock"]
     callee_lock = ce["lock"]
@@ -900,10 +994,10 @@ async def run_bridge(caller_uuid):
             await asyncio.sleep(0.5)
 
     await asyncio.gather(
-        one_way_bridge("caller→callee", ci["queue"], ce["writer"], callee_lock,
+        one_way_bridge("caller→callee", caller_uuid, cid, dest, ci["queue"], ce["writer"], callee_lock,
                        lambda: ci.get("alive", False), lambda: ce.get("alive", False),
                        "English", lang, callee_speaking, caller_speaking),
-        one_way_bridge("callee→caller", ce["queue"], ci["writer"], caller_lock,
+        one_way_bridge("callee→caller", caller_uuid, cid, dest, ce["queue"], ci["writer"], caller_lock,
                        lambda: ce.get("alive", False), lambda: ci.get("alive", False),
                        lang, "English", caller_speaking, callee_speaking),
         keepalive_leg(ci, caller_lock),
@@ -913,6 +1007,7 @@ async def run_bridge(caller_uuid):
 async def handle_connection(reader, writer):
     peer = writer.get_extra_info("peername")
     log.info(f"New connection from {peer}")
+    disconnect_reason = "disconnect"
     try:
         t, p = await read_frame(reader, timeout=10)
         if t != MSG_UUID: writer.close(); return
@@ -936,8 +1031,33 @@ async def handle_connection(reader, writer):
 
     # setdefault: never overwrite existing entry (fixes race where callee
     # arrives before caller and caller's init would wipe the callee conn)
-    calls.setdefault(caller_uuid, {"caller": None, "callee": None, "lang": lang, "cid": cid})
+    calls.setdefault(caller_uuid, {
+        "caller": None,
+        "callee": None,
+        "lang": lang,
+        "cid": cid,
+        "dest": dest,
+        "caller_uuid": caller_uuid,
+        "callee_uuid": callee_uuid,
+        "ended_emitted": False,
+    })
+    calls[caller_uuid]["lang"] = lang
+    calls[caller_uuid]["cid"] = cid
+    calls[caller_uuid]["dest"] = dest
+    calls[caller_uuid]["caller_uuid"] = caller_uuid
+    calls[caller_uuid]["callee_uuid"] = callee_uuid
     calls[caller_uuid][role] = conn
+    emit_dashboard_event(
+        "call.upsert",
+        callId=caller_uuid,
+        callerUuid=caller_uuid,
+        calleeUuid=callee_uuid,
+        cid=cid,
+        dest=dest,
+        lang=lang,
+        role=role,
+        active=True,
+    )
 
     if role == "caller":
         log.info(f"Caller connected - playing ringback, originating to {dest}")
@@ -979,10 +1099,12 @@ async def handle_connection(reader, writer):
             t, p = await read_frame(reader, timeout=None)
             if t == MSG_HANGUP:
                 log.info(f"{role} hung up")
+                disconnect_reason = "hangup"
                 break
             if t == MSG_AUDIO and p:
                 await queue.put(p)
     except Exception as e:
+        disconnect_reason = str(e) or "disconnect"
         log.info(f"{role} ended: {e}")
     finally:
         stop_ka.set()
@@ -991,6 +1113,19 @@ async def handle_connection(reader, writer):
 
         # Hang up the other party
         call = calls.get(caller_uuid, {})
+        if call and not call.get("ended_emitted"):
+            call["ended_emitted"] = True
+            emit_dashboard_event(
+                "call.ended",
+                callId=caller_uuid,
+                callerUuid=call.get("caller_uuid", caller_uuid),
+                calleeUuid=call.get("callee_uuid", ""),
+                cid=call.get("cid", cid),
+                dest=call.get("dest", dest),
+                lang=call.get("lang", lang),
+                role=role,
+                reason=disconnect_reason,
+            )
         other_role = "callee" if role == "caller" else "caller"
         other = call.get(other_role)
         if other and other.get("alive"):

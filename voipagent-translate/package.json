@@ -1,0 +1,15 @@
+{
+  "name": "voipagent-translate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live translation transcript dashboard for translate.voipagent.dev",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "ws": "^8.18.0"
+  }
+}

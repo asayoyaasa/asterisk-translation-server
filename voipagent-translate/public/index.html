@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VoIPAgent Translate Monitor</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="eyebrow">translate.voipagent.dev</div>
+          <h1>Live Translation Monitor</h1>
+          <p>Read call transcripts as soon as the bridge receives them.</p>
+        </div>
+
+        <div class="toolbar">
+          <input id="search" type="search" placeholder="Search by CID, number, language">
+          <div class="toolbar-note">Only live calls are shown here.</div>
+        </div>
+
+        <div id="call-list" class="call-list"></div>
+      </aside>
+
+      <main class="main">
+        <header class="main-header">
+          <div>
+            <div class="eyebrow">Selected conversation</div>
+            <h2 id="call-title">No call selected</h2>
+          </div>
+          <div class="header-meta">
+            <span id="call-status" class="status-pill idle">Waiting</span>
+            <span id="call-lang" class="meta-chip">Language: -</span>
+            <span id="call-cid" class="meta-chip">CID: -</span>
+          </div>
+        </header>
+
+        <section class="hint-card">
+          <strong>How to use this view:</strong>
+          ORIGINAL text often appears before the translated TTS has finished playing, so you can read ahead while the audio is still catching up.
+        </section>
+
+        <section id="empty-state" class="empty-state">
+          <h3>No call selected</h3>
+          <p>Pick an active call from the left to view it as a caller/callee chat.</p>
+        </section>
+
+        <section id="timeline" class="timeline hidden"></section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
