@@ -28,8 +28,8 @@ HANGUP_FRAME = struct.pack(">BH", MSG_HANGUP, 0)
 
 # ── Local silence detection for staging segmentation ─────────────────────────
 SILENCE_THRESHOLD = 300       # mean amplitude threshold for silence
-SILENCE_DURATION_CHUNKS = 12  # ~240ms worth of 20ms chunks (shorter for faster turn detection)
-MIN_AUDIO_CHUNKS = 5         # Realtime API needs at least ~100ms of audio per commit
+SILENCE_DURATION_CHUNKS = 16  # ~320ms to reduce premature segmentation on natural pauses
+MIN_AUDIO_CHUNKS = 8         # ~160ms minimum to avoid tiny commits that often transcribe empty
 MIN_VOICED_CHUNKS = 3        # Require ~60ms of voiced audio before treating noise as speech
 TRANSCRIPT_WAIT_SECONDS = 5.0
 
@@ -709,9 +709,13 @@ async def one_way_bridge(label, call_id, cid, dest, src_queue, dst_writer, dst_l
                             and pending_audio_chunks
                             and dst_alive_fn()):
                         speaking_flag[0] = True
-                        frames_sent = await play_buffered_audio()
-                        log.info(f"[{label}] sent {frames_sent} frames to dst")
-                        if current_response_id[0] and current_response_text[0] and frames_sent > 0:
+                        # Emit playback event BEFORE audio starts so the dashboard
+                        # karaoke timer begins in real time, not after audio finishes.
+                        estimated_frames = sum(
+                            len(resample_down(c)) // 320 + (1 if len(resample_down(c)) % 320 else 0)
+                            for c in pending_audio_chunks
+                        )
+                        if current_response_id[0] and current_response_text[0] and estimated_frames > 0:
                             emit_dashboard_event(
                                 "utterance.playback",
                                 callId=call_id,
@@ -722,8 +726,10 @@ async def one_way_bridge(label, call_id, cid, dest, src_queue, dst_writer, dst_l
                                 dstLang=dst_lang,
                                 responseId=current_response_id[0],
                                 text=current_response_text[0],
-                                playbackMs=frames_sent * 20,
+                                playbackMs=estimated_frames * 20,
                             )
+                        frames_sent = await play_buffered_audio()
+                        log.info(f"[{label}] sent {frames_sent} frames to dst")
                     else:
                         pending_audio_chunks.clear()
                         speaking_flag[0] = False

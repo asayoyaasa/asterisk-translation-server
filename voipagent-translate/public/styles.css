@@ -363,42 +363,31 @@ body {
 }
 
 .karaoke-text {
-  position: relative;
+  --karaoke-progress: 0%;
 }
 
-.karaoke-text .karaoke-base,
-.karaoke-text .karaoke-fill {
+.karaoke-text .karaoke-content {
   display: block;
   white-space: pre-wrap;
+  background-image: linear-gradient(
+    90deg,
+    #0f766e 0%,
+    #0f766e var(--karaoke-progress),
+    rgba(22, 32, 51, 0.42) var(--karaoke-progress),
+    rgba(22, 32, 51, 0.42) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 
-.karaoke-text .karaoke-base {
-  color: rgba(22, 32, 51, 0.4);
-}
-
-.karaoke-text .karaoke-fill {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 0;
-  overflow: hidden;
-  color: var(--text);
-}
-
-.message-bubble.translated .karaoke-fill {
-  color: #0f766e;
-}
-
-.karaoke-text.playing .karaoke-fill {
-  animation: karaoke-fill var(--karaoke-duration) linear forwards;
-  animation-delay: var(--karaoke-delay);
-}
-
-.karaoke-text.done .karaoke-fill {
-  width: 100%;
-}
-
-.karaoke-text.queued .karaoke-base {
+.karaoke-text.queued .karaoke-content {
+  background: none;
   color: rgba(22, 32, 51, 0.6);
+}
+
+.karaoke-text.done .karaoke-content {
+  background-image: linear-gradient(90deg, #0f766e 0%, #0f766e 100%);
 }
 
 .karaoke-meter {
@@ -411,27 +400,8 @@ body {
 
 .karaoke-meter-fill {
   height: 100%;
-  width: 0;
   border-radius: inherit;
   background: linear-gradient(90deg, #14b8a6 0%, #22c55e 100%);
-}
-
-.karaoke-meter-fill.playing {
-  animation: karaoke-fill var(--karaoke-duration) linear forwards;
-  animation-delay: var(--karaoke-delay);
-}
-
-.karaoke-meter-fill.done {
-  width: 100%;
-}
-
-@keyframes karaoke-fill {
-  from {
-    width: 0;
-  }
-  to {
-    width: 100%;
-  }
 }
 
 .hidden {

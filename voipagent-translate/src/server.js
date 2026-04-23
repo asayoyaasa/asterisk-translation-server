@@ -122,6 +122,11 @@ function applyEvent(event, { silent = false } = {}) {
   switch (event.type) {
     case 'call.upsert':
       call.active = event.active !== false;
+      if (call.active) {
+        call.endedAt = null;
+        call.endReason = '';
+        call.disconnectedRole = '';
+      }
       if (event.role === 'caller' || event.role === 'callee') {
         call.rolesConnected[event.role] = true;
       }
@@ -129,13 +134,18 @@ function applyEvent(event, { silent = false } = {}) {
 
     case 'call.ready':
       call.active = true;
+      call.endedAt = null;
+      call.endReason = '';
+      call.disconnectedRole = '';
       call.readyAt = ts;
       break;
 
     case 'utterance.original':
     case 'utterance.translated':
     case 'utterance.filtered':
-      call.active = true;
+      if (!call.endedAt) {
+        call.active = true;
+      }
       pushCallEvent(call, {
         id: `${callId}:${call.events.length + 1}:${Date.parse(ts)}`,
         type: event.type,
@@ -153,7 +163,9 @@ function applyEvent(event, { silent = false } = {}) {
       break;
 
     case 'utterance.playback':
-      call.active = true;
+      if (!call.endedAt) {
+        call.active = true;
+      }
       applyPlaybackUpdate(call, event, ts);
       break;
 
@@ -216,6 +228,7 @@ function publicEvent(event) {
 }
 
 function summarizeCall(call) {
+  const isActive = call.active && !call.endedAt;
   return {
     callId: call.callId,
     cid: call.cid,
@@ -223,7 +236,7 @@ function summarizeCall(call) {
     lang: call.lang,
     callerUuid: call.callerUuid,
     calleeUuid: call.calleeUuid,
-    active: call.active,
+    active: isActive,
     startedAt: call.startedAt,
     readyAt: call.readyAt,
     endedAt: call.endedAt,
@@ -237,7 +250,7 @@ function summarizeCall(call) {
 
 function visibleSummaries() {
   return Array.from(calls.values())
-    .filter((call) => call.active)
+    .filter((call) => call.active && !call.endedAt)
     .sort((a, b) => {
       return Date.parse(b.lastEventAt || b.startedAt || 0) - Date.parse(a.lastEventAt || a.startedAt || 0);
     })

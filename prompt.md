@@ -33,6 +33,8 @@ NEVER [SKIP] THESE — they are valid utterances that MUST be translated:
 - Questions: "What?", "Really?", "How?", "Who?", "Apa?", "Siapa?"
 - Numbers: "One", "Two", "Three", "1, 2, 3"
 - ANY recognizable word in ANY language — even a single word — must be translated.
+- Any clear grammatical sentence or phrase in plain English must be translated, never [SKIP].
+- Any clear grammatical sentence or phrase in plain Indonesian must be translated, never [SKIP].
 - When in doubt between translating and [SKIP], ALWAYS translate.
 
 CRITICAL — [SKIP] IS THE ONLY ALLOWED ALTERNATIVE TO A TRANSLATION:
@@ -87,6 +89,9 @@ CORRECT EXAMPLES:
   Input: "Game and as a"                    →  "Permainan dan sebagai"
   Input: "Enggak ada suara."               →  "There's no sound." (colloquial Indonesian)
   Input: "Bisa dengar saya?"               →  "Can you hear me?"
+  Input: "I don't know what to do with my life now." → "Saya tidak tahu harus berbuat apa dengan hidup saya sekarang."
+  Input: "I guess you could say so, probably." → "Kurasa bisa dibilang begitu, mungkin."
+  Input: "Bye. Bye. Bye. Bye."            →  "Dadah. Dadah. Dadah. Dadah."
   Input: "uh" / "um" / silence             →  [SKIP]
   Input: "Təs təslı."                      →  [SKIP]  (IPA/garbage characters)
   Input: "Bruno Fox jam ofur wozido."      →  [SKIP]  (phonetic noise — do NOT confabulate)

@@ -2,7 +2,9 @@ const state = {
   calls: new Map(),
   selectedCallId: null,
   eventsByCall: new Map(),
-  search: ''
+  search: '',
+  lastTimelineCallId: null,
+  lastTimelineEventCount: 0
 };
 
 const callListEl = document.getElementById('call-list');
@@ -13,6 +15,7 @@ const callStatusEl = document.getElementById('call-status');
 const callLangEl = document.getElementById('call-lang');
 const callCidEl = document.getElementById('call-cid');
 const searchEl = document.getElementById('search');
+let playbackTicker = null;
 
 function formatWhen(value) {
   if (!value) return '-';
@@ -162,17 +165,14 @@ function karaokeTextMarkup(event) {
   }
 
   const playback = playbackState(event);
-  const style = playback.durationMs
-    ? ` style="--karaoke-duration:${playback.durationMs}ms; --karaoke-delay:-${playback.elapsedMs}ms; --karaoke-progress:${playback.progressPct}%"`
-    : '';
+  const style = ` style="--karaoke-progress:${playback.progressPct}%"`;
 
   return `
     <div class="timeline-card-text karaoke-text ${playback.status}"${style}>
-      <span class="karaoke-base">${text}</span>
-      <span class="karaoke-fill">${text}</span>
+      <span class="karaoke-content">${text}</span>
     </div>
     <div class="karaoke-meter">
-      <div class="karaoke-meter-fill ${playback.status}"${style}></div>
+      <div class="karaoke-meter-fill ${playback.status}" style="width:${playback.progressPct}%"></div>
     </div>
   `;
 }
@@ -207,6 +207,54 @@ function groupTimelineEvents(events) {
   return groups;
 }
 
+function visibleTimelineEvents(rawEvents) {
+  const hiddenIds = new Set();
+
+  for (const event of rawEvents) {
+    if (event.type !== 'utterance.filtered') {
+      continue;
+    }
+
+    if (event.responseId) {
+      for (const candidate of rawEvents) {
+        if (candidate.responseId === event.responseId && candidate.type === 'utterance.translated') {
+          hiddenIds.add(candidate.id);
+        }
+      }
+    }
+
+    const originalText = (event.original || '').trim();
+    if (!originalText) {
+      continue;
+    }
+
+    for (let index = rawEvents.length - 1; index >= 0; index -= 1) {
+      const candidate = rawEvents[index];
+      if (candidate.type !== 'utterance.original') {
+        continue;
+      }
+      if (candidate.direction !== event.direction) {
+        continue;
+      }
+      if ((candidate.text || '').trim() !== originalText) {
+        continue;
+      }
+      if (hiddenIds.has(candidate.id)) {
+        continue;
+      }
+      hiddenIds.add(candidate.id);
+      break;
+    }
+  }
+
+  return rawEvents.filter((event) => {
+    if (event.type !== 'utterance.original' && event.type !== 'utterance.translated') {
+      return false;
+    }
+    return !hiddenIds.has(event.id);
+  });
+}
+
 function scrollTimelineToLatest() {
   const lastCard = timelineEl.lastElementChild;
   if (!lastCard) return;
@@ -215,15 +263,28 @@ function scrollTimelineToLatest() {
   });
 }
 
+function syncPlaybackTicker(events) {
+  const hasActivePlayback = events.some((event) => playbackState(event).status === 'playing');
+  if (hasActivePlayback && !playbackTicker) {
+    playbackTicker = window.setInterval(() => {
+      renderTimeline();
+    }, 150);
+  } else if (!hasActivePlayback && playbackTicker) {
+    window.clearInterval(playbackTicker);
+    playbackTicker = null;
+  }
+}
+
 function renderTimeline() {
   const call = state.selectedCallId ? state.calls.get(state.selectedCallId) : null;
-  const events = state.selectedCallId
-    ? (state.eventsByCall.get(state.selectedCallId) || []).filter((event) =>
-        event.type === 'utterance.original' || event.type === 'utterance.translated')
-      : [];
+  const rawEvents = state.selectedCallId
+    ? (state.eventsByCall.get(state.selectedCallId) || [])
+    : [];
+  const events = visibleTimelineEvents(rawEvents);
   const groups = groupTimelineEvents(events);
 
   if (!call) {
+    syncPlaybackTicker([]);
     emptyStateEl.classList.remove('hidden');
     timelineEl.classList.add('hidden');
     callTitleEl.textContent = 'No call selected';
@@ -245,6 +306,7 @@ function renderTimeline() {
   timelineEl.innerHTML = '';
 
   if (!groups.length) {
+    syncPlaybackTicker([]);
     timelineEl.innerHTML = '<div class="empty-state"><h3>No transcript yet</h3><p>This call is selected, but no ORIGINAL or TRANSLATED rows have arrived yet.</p></div>';
     return;
   }
@@ -295,7 +357,16 @@ function renderTimeline() {
     timelineEl.appendChild(groupEl);
   }
 
-  scrollTimelineToLatest();
+  syncPlaybackTicker(events);
+
+  const shouldScroll =
+    state.lastTimelineCallId !== call.callId ||
+    state.lastTimelineEventCount !== events.length;
+  state.lastTimelineCallId = call.callId;
+  state.lastTimelineEventCount = events.length;
+  if (shouldScroll) {
+    scrollTimelineToLatest();
+  }
 }
 
 function escapeHtml(value) {
@@ -362,7 +433,7 @@ function connectWebSocket() {
         state.calls.delete(payload.call.callId);
       }
       if (payload.event && payload.call.callId) {
-        const eventTypes = new Set(['utterance.original', 'utterance.translated']);
+        const eventTypes = new Set(['utterance.original', 'utterance.translated', 'utterance.filtered']);
         if (eventTypes.has(payload.event.type)) {
           const current = state.eventsByCall.get(payload.call.callId) || [];
           state.eventsByCall.set(payload.call.callId, [...current, payload.event]);
