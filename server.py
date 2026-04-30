@@ -16,10 +16,8 @@ HOST, PORT = "127.0.0.1", 5001
 AMI_HOST, AMI_PORT = "127.0.0.1", 5038
 AMI_USER, AMI_SECRET = "translation", "TrServer2024!"
 
-# ── Beta API (proven working) ──────────────────────────────────────────────────
-OPENAI_MODEL  = "gpt-4o-realtime-preview-2024-12-17"
+OPENAI_MODEL  = os.environ.get("OPENAI_MODEL", "gpt-4o-realtime-preview-2024-12-17")
 OPENAI_WS_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
-# ──────────────────────────────────────────────────────────────────────────────
 
 MSG_UUID, MSG_AUDIO, MSG_HANGUP = 0x01, 0x10, 0xff
 SILENCE_PAYLOAD = bytes(320)
@@ -650,6 +648,7 @@ async def one_way_bridge(label, call_id, cid, dest, src_queue, dst_writer, dst_l
             async def pipe_out():
                 auto_reset_task = None
                 response_done_fallback_task = None
+                response_watchdog_task = None
                 response_audio_seen = [False]
                 transcript_decided = asyncio.Event()
                 current_response_blocked = [True]
@@ -689,7 +688,7 @@ async def one_way_bridge(label, call_id, cid, dest, src_queue, dst_writer, dst_l
                     return frames_sent
 
                 async def finalize_response(no_audio: bool = False):
-                    nonlocal auto_reset_task, response_done_fallback_task, response_finish_task
+                    nonlocal auto_reset_task, response_done_fallback_task, response_finish_task, response_watchdog_task
                     if response_finalized[0]:
                         return
                     response_finalized[0] = True
@@ -700,6 +699,8 @@ async def one_way_bridge(label, call_id, cid, dest, src_queue, dst_writer, dst_l
                         response_done_fallback_task.cancel()
                     if response_finish_task and not response_finish_task.done():
                         response_finish_task.cancel()
+                    if response_watchdog_task and not response_watchdog_task.done():
+                        response_watchdog_task.cancel()
 
                     items_to_delete = list(pending_item_ids)
                     pending_item_ids.clear()
@@ -894,10 +895,22 @@ async def one_way_bridge(label, call_id, cid, dest, src_queue, dst_writer, dst_l
                                 response_done_fallback_task.cancel()
                             if response_finish_task and not response_finish_task.done():
                                 response_finish_task.cancel()
-                            # FIX: suppress collector EARLY — as soon as OpenAI
-                            # starts generating a response, switch to staging so
-                            # no new audio leaks into the input buffer and gets
-                            # lost when we clear it later
+                            # Watchdog: if OpenAI goes silent for 8s after response.created,
+                            # force-finalize so the bridge doesn't hang indefinitely.
+                            if response_watchdog_task and not response_watchdog_task.done():
+                                response_watchdog_task.cancel()
+                            async def _response_watchdog():
+                                try:
+                                    await asyncio.sleep(8.0)
+                                    if not response_finalized[0]:
+                                        log.warning(f"[{label}] response watchdog: no completion after 8s, forcing finalize")
+                                        await finalize_response(no_audio=not pending_audio_chunks)
+                                except asyncio.CancelledError:
+                                    pass
+                            response_watchdog_task = asyncio.create_task(_response_watchdog())
+                            # Suppress collector EARLY — as soon as OpenAI starts generating
+                            # a response, switch to staging so no new audio leaks into the
+                            # input buffer and gets lost when we clear it later.
                             if not speaking_flag[0]:
                                 utterance_done.clear()
                                 try:

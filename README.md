@@ -9,324 +9,375 @@ This service sits between two call legs:
 
 For each direction, the server listens to raw 8 kHz PCM from Asterisk, resamples it to 24 kHz for OpenAI, asks the model to translate only what was actually said, then resamples the generated audio back to 8 kHz and plays it to the other party.
 
-The current implementation is optimized for live calls, low latency, and damage control when the model or ASR gets confused. It is not a chatbot. It is a narrow translation bridge.
+---
 
-## What This Project Does
+## Current Status (2026-04-30)
 
-At a high level, the server:
+Translation is operational. Two bugs fixed this session:
 
-1. Accepts AudioSocket connections from Asterisk on `127.0.0.1:5001`
-2. Matches the incoming UUID to call metadata stored in `/tmp/call_<caller_uuid>.txt`
-3. Determines whether the connection is the caller leg or callee leg
-4. Starts ringback for the caller while originating the outbound call over AMI
-5. Once both legs are present, starts two independent translation pipelines:
-   - `caller -> callee` translates English into the destination language
-   - `callee -> caller` translates the destination language back into English
-6. Streams translated audio back into the opposite leg in near real time
+**Bug 1 — VoipNow wrong trunk (caller heard directly, no translation)**
+Root cause: the 888 prefix route in VoipNow was pointing to the wrong SIP trunk, so calls bypassed Asterisk entirely and connected caller to callee directly.
+Fix: corrected the trunk in VoipNow admin. No code changes needed.
+
+**Bug 2 — Callee hears nothing for caller's first utterance (~33s gap)**
+Root cause: OpenAI Realtime API occasionally delays `response.audio.done` by 30+ seconds after `response.created`. The `utterance_done` asyncio.Event stayed blocked for that entire window, so all subsequent caller speech was silently staged and never reached the callee.
+Fix: added an 8-second watchdog task in `pipe_out()`. If no `response.audio.done` (or finalization) arrives within 8s of `response.created`, the watchdog calls `finalize_response()` and unblocks the queue. Log signature when it fires:
+```
+[caller→callee] response watchdog: no completion after 8s, forcing finalize
+```
+This fix is deployed. The service was restarted at Apr 30 12:33:58 and is currently active.
+
+**Action needed**: make a test call to confirm both directions translate. If the watchdog fires in the log, the fix is working.
+
+---
+
+## How It Works
+
+1. User dials `888` + destination number from VoipNow PBX
+2. VoipNow strips the `888` prefix and forwards the call via SIP to our Asterisk at `188.116.36.83:5060`
+3. Asterisk routes the call through `[from-voipnow]` dialplan context, writes call metadata to `/tmp/call_<uuid>.txt`, then hands audio to AudioSocket on `127.0.0.1:5001`
+4. Translation server (`server.py`) receives the caller leg, plays ringback, and originates the callee leg via AMI to DIDLogic
+5. Once both legs are connected, two independent OpenAI Realtime sessions run:
+   - `caller→callee`: English → destination language
+   - `callee→caller`: destination language → English
+
+---
+
+## VoipNow SIP Trunk Requirements
+
+The `888` prefix route in VoipNow **must** be configured to forward to our Asterisk:
+
+| Field | Value |
+|-------|-------|
+| Host | `188.116.36.83` |
+| Port | `5060` |
+| Protocol | UDP |
+| Strip prefix | Yes — strip `888` before forwarding |
+
+Our Asterisk identifies VoipNow by IP only (no auth). Both `89.38.54.13` and `89.38.54.17` are whitelisted in the PJSIP identify rules. If VoipNow's source IP changes, add it to `/etc/asterisk/pjsip.conf` under a new `[voipnow-identify]` section and run `asterisk -rx "module reload res_pjsip"`.
+
+---
+
+## Troubleshooting: Voice Heard Directly (No Translation)
+
+Symptom: caller and callee hear each other without translation.
+
+This means calls are **bypassing the translation server** entirely. Check in order:
+
+### 1. Is Asterisk receiving SIP traffic from VoipNow?
+
+```bash
+# Brief tcpdump on SIP port — run this on the VPS (188.116.36.83)
+timeout 10 tcpdump -i any -n port 5060
+
+# Look for voipnow channels in Asterisk
+grep 'voipnow' /var/log/asterisk/messages.log | tail -10
+```
+
+If no traffic appears, VoipNow is not forwarding the call to our Asterisk. Fix the 888 route in VoipNow admin — this was the root cause on 2026-04-30.
+
+### 2. Is the translation server listening?
+
+```bash
+ss -ltnp | grep 5001
+# Expect: LISTEN 0 100 127.0.0.1:5001
+```
+
+### 3. Is the translation server receiving connections?
+
+```bash
+tail -f /var/log/translation-server.log
+# Should show "New connection from peer" when a call arrives
+```
+
+If Asterisk receives the call but translation-server shows nothing:
+
+```bash
+nc -z 127.0.0.1 5001 && echo 'port open' || echo 'port closed'
+```
+
+### 4. Did the callee originate?
+
+```bash
+# Check if AMI user exists and password matches
+grep -A5 '\[translation\]' /etc/asterisk/manager.conf
+# Compare with AMI_SECRET in server.py (hardcoded: "TrServer2024!")
+
+# Check if DIDLogic is registered
+asterisk -rx "pjsip show registrations"
+```
+
+### 5. Verify PJSIP identify rules
+
+```bash
+asterisk -rx "pjsip show identify"
+# voipnow-identify should show match=89.38.54.13/32
+# voipnow2-identify should show match=89.38.54.17/32
+```
+
+If VoipNow now sends from a different IP, add to `/etc/asterisk/pjsip.conf`:
+
+```ini
+[voipnow3-identify]
+type=identify
+endpoint=voipnow
+match=<new_voipnow_ip>
+```
+
+Then: `asterisk -rx "module reload res_pjsip"`
+
+---
+
+## Troubleshooting: One Direction Silent (callee hears nothing)
+
+Symptom: one party hears translations, the other hears silence.
+
+This was the second bug fixed on 2026-04-30. The `utterance_done` event gets stuck blocked when OpenAI delays finalizing a response.
+
+Check the log for:
+```bash
+grep -E "watchdog|forced finalize|response watchdog" /var/log/translation-server.log
+```
+
+If the watchdog fires frequently (multiple times per call), OpenAI Realtime is consistently slow to finalize. The 8s threshold in `_response_watchdog()` (inside `pipe_out()` in `server.py`) can be lowered — but going below 4s risks cutting off legitimate long translations.
+
+If the watchdog never fires but one direction is still silent:
+1. Check `[METRICS]` lines — `played=0` means audio is not reaching the destination socket
+2. Check `filtered=N` — if high, the post-filter is blocking translations (check `post_filter()` in `server.py`)
+3. Check that both legs connected: log should show "Both legs ready - starting bridge"
+4. Check that `one_way_bridge` did not crash: look for `[caller→callee] bridge error:` lines
+
+---
 
 ## Repository Files
 
-- `server.py`
-  The only supported runtime entrypoint. Handles call setup, AMI origination, OpenAI sessions, audio bridging, filtering, cleanup, and metrics.
-- `prompt.md`
-  The system prompt template used for translation. It tells the model to translate literally, treat each utterance independently, and output `[SKIP]` instead of inventing speech.
-- `languages.py`
-  Maps E.164 country codes to a spoken language name. This is how the destination language is chosen.
+- `server.py` — runtime entrypoint; call setup, AMI origination, OpenAI sessions, audio bridging, filtering, cleanup, metrics
+- `prompt.md` — system prompt template; tells model to translate literally and use `[SKIP]` for noise
+- `languages.py` — maps E.164 country codes to language names for destination language selection
 
-## Runtime Architecture
-
-## Translation Flow Diagram
-
-![Realtime translation flow](docs/translation-flow.svg)
+---
 
 ## Call Setup
 
-The server expects Asterisk to create a temporary call record in `/tmp` that contains:
+Asterisk writes a file to `/tmp/call_<caller_uuid>.txt` before connecting to AudioSocket:
 
-- caller UUID
-- callee UUID
-- destination number
-- caller ID
+```
+<CALLER_UUID> <CALLEE_UUID> <DEST_NUMBER> <REAL_CALLERID>
+```
 
-When a socket connects, `server.py` reads the first AudioSocket frame, extracts the UUID, and looks up the call metadata. If the UUID matches the caller UUID from the file, that leg is treated as the caller. If it matches the callee UUID, that leg is treated as the callee.
+When a socket connects, `server.py` reads the UUID frame and looks up the file. If the UUID matches the caller UUID it's the caller leg; if it matches the callee UUID it's the callee leg.
 
 Caller flow:
-
-1. Caller connects
-2. The server sends silence immediately to keep the socket healthy
-3. Ringback is played locally
-4. The server originates the callee leg through Asterisk AMI
+1. Connect → send silence → start ringback → originate callee via AMI
 
 Callee flow:
+1. Connect → stop ringback → bridge starts
 
-1. Callee connects
-2. The server stops ringback
-3. The bridge starts as soon as both legs are alive
+---
 
 ## Bridge Model
 
-`run_bridge()` launches four coroutines together:
+`run_bridge()` launches four coroutines:
 
-- one `one_way_bridge()` for `caller -> callee`
-- one `one_way_bridge()` for `callee -> caller`
-- one keepalive loop for the caller leg
-- one keepalive loop for the callee leg
+- `one_way_bridge()` caller→callee
+- `one_way_bridge()` callee→caller
+- keepalive loop for caller leg
+- keepalive loop for callee leg
 
-Each `one_way_bridge()` owns one OpenAI realtime session and one direction of translation.
+Each `one_way_bridge()` owns one OpenAI Realtime session.
+
+---
 
 ## Audio Pipeline
 
-The AudioSocket side uses 8 kHz signed 16-bit PCM. The OpenAI Realtime API expects 24 kHz PCM. The pipeline is:
-
-1. Asterisk sends 8 kHz audio frames
-2. `resample_up()` converts them to 24 kHz
-3. Audio is appended into the OpenAI input buffer
-4. A commit is triggered when speech plus trailing silence indicates a complete utterance
-5. The model transcribes and translates the utterance
+1. Asterisk sends 8 kHz signed 16-bit PCM chunks (AudioSocket protocol)
+2. `resample_up()` converts to 24 kHz for OpenAI
+3. Audio appended into OpenAI input buffer
+4. Local silence detection commits utterances (~320 ms trailing silence threshold)
+5. OpenAI transcribes (Whisper) and translates (realtime model)
 6. OpenAI returns translated audio at 24 kHz
-7. `resample_down()` converts it back to 8 kHz
-8. The translated audio is streamed into the other call leg
+7. `resample_down()` converts back to 8 kHz
+8. Translated audio streamed to other call leg
+
+---
 
 ## Translation Pipeline Details
 
-The bridge is designed around three internal tasks inside `one_way_bridge()`:
+Three tasks inside each `one_way_bridge()`:
 
-- `collector()`
-  Reads source audio from the queue. When no TTS is playing, it streams audio directly to OpenAI. When translated audio is currently being played, it stages incoming speech locally and segments it by silence.
-- `sender()`
-  Replays staged utterances after the current response has finished, so overlapping speech is serialized instead of dropped.
-- `pipe_out()`
-  Reads OpenAI events, logs transcripts, plays translated audio, deletes conversation items, handles error recovery, and resets state when a response ends.
+- `collector()` — reads source audio; streams to OpenAI when no TTS playing; stages locally when TTS active
+- `sender()` — replays staged utterances after current response finishes (serializes overlapping speech)
+- `pipe_out()` — reads OpenAI events, plays translated audio, cleans up conversation items, handles errors
 
-This design allows the speaker to continue talking while the other side is still hearing TTS. New utterances are queued and replayed in order.
+### Response lifecycle
 
-## Prompting Strategy
+```
+response.created
+  → watchdog armed (8s timeout)
+  → collector switches to staging mode (utterance_done cleared)
+response.audio.delta  (0..N chunks)
+response.audio.done
+  → finish_after_timeout() starts (2.5s)
+response.audio_transcript.done
+  → post_filter() decides whether to play or drop
+  → finalize_response() called
+    → watchdog cancelled
+    → audio played to dst (if not filtered)
+    → 550ms cooldown
+    → utterance_done set (unblocks sender/collector)
+```
 
-The prompt in `prompt.md` is strict on purpose. The model is told:
+If OpenAI skips `response.audio.done` or delays it >8s, the watchdog fires `finalize_response()` directly.
 
-- output only translated text or `[SKIP]`
-- never answer as an assistant
-- never add greetings, politeness, or explanations that were not spoken
-- preserve names and register
-- translate partial utterances literally instead of completing them
-- treat each utterance independently
-- never use earlier call context to invent a plausible sentence
-
-This prompt is loaded at startup, cached per language pair, and sent as the OpenAI session instructions.
+---
 
 ## Hallucination Controls
 
-The current production path uses several defenses together.
+1. Stateless utterances — conversation items deleted after each response
+2. Short-utterance guard — utterances under `MIN_AUDIO_CHUNKS` (8 chunks ~160 ms) dropped
+3. Transcript-gated response — `response.create` only fires after `input_audio_transcription.completed`
+4. Post-filtering — blocks empty output, `[SKIP]`, too-short translations, assistant phrases, near-duplicates
+5. Lower temperature (0.6) — reduces improvisation
 
-### 1. Stateless utterance handling
-
-After each response, the bridge deletes tracked OpenAI conversation items so prior turns do not keep accumulating in model memory.
-
-### 2. Short-utterance guard
-
-Queued utterances shorter than `MIN_AUDIO_CHUNKS` are dropped before replay. This prevents tiny fragments from being committed as if they were complete speech.
-
-### 3. Transcript-gated response creation
-
-Before `response.create` is sent, the bridge waits for the committed input item and then for that specific item's `conversation.item.input_audio_transcription.completed` event. If no usable transcript appears, that utterance is dropped instead of asking the model to improvise.
-
-### 4. Post-filtering
-
-`post_filter()` blocks output when the translated transcript looks suspicious. It filters:
-
-- empty output
-- `[SKIP]`
-- translations that are far too short for the source
-- canned assistant phrases
-- known hallucination phrases such as "no translation"
-- near-duplicate responses
-
-### 5. Lower temperature
-
-The realtime session is configured with a lower temperature to reduce improvisation and keep output closer to literal translation.
-
-## Response-Lifecycle Protection
-
-One of the main failure modes in realtime translation is overlapping `response.create` calls. If the next response is created before the previous one fully finishes, OpenAI can return:
-
-- `conversation_already_has_active_response`
-
-The current code reduces that risk by:
-
-- serializing `response.create` behind a lock
-- tracking `response_active` with an `asyncio.Event`
-- only creating a new response after the previous one has been marked complete
-- treating commit-empty and already-active-response errors as recoverable conditions
-
-This is especially important during fast turn-taking or when the caller speaks again while TTS is still playing.
-
-## Echo and Barge-In Handling
-
-The server keeps per-direction `speaking_flag` state.
-
-- If the peer is currently playing translated audio and speech is detected, that may be echo leakage, so the bridge can cancel the active response.
-- If the local side speaks while its own TTS is playing, the new audio is buffered instead of immediately cancelling that side's response.
-
-This behavior is a compromise between responsiveness and stability. It tries to avoid echo loops without throwing away legitimate follow-up speech.
+---
 
 ## Language Selection
 
-`languages.py` maps destination phone prefixes to language names. The logic:
+`languages.py` maps the destination number prefix to a language name:
 
-1. strips the leading `+`
-2. tries a 3-digit prefix
-3. then a 2-digit prefix
-4. then a 1-digit prefix
-5. falls back to English
+1. Strip leading `+`
+2. Try 3-digit prefix → 2-digit → 1-digit
+3. Default: English
 
-Examples:
+Examples: `62...` → Indonesian, `84...` → Vietnamese, `81...` → Japanese, `1...` → English
 
-- `62...` -> Indonesian
-- `84...` -> Vietnamese
-- `52...` -> Spanish
-- `1...` -> English
-
-The selected language is used in two places:
-
-- the language-pair prompt
-- the Whisper transcription hint sent to OpenAI
+---
 
 ## OpenAI Configuration
 
-The current server uses:
+| Setting | Value |
+|---------|-------|
+| Model | `gpt-4o-realtime-preview-2024-12-17` (env `OPENAI_MODEL` overrides) |
+| WS endpoint | `wss://api.openai.com/v1/realtime` |
+| Transcription | `whisper-1` |
+| Voice | `marin` |
+| Temperature | `0.6` |
 
-- model: `gpt-4o-realtime-preview-2024-12-17`
-- realtime websocket endpoint: `wss://api.openai.com/v1/realtime`
-- input transcription model: `whisper-1`
-- voice: `marin`
+`OPENAI_API_KEY` is loaded from `/etc/translation-server.env`.
+`OPENAI_MODEL` can be overridden in `/etc/translation-server.env` — the server reads it with a fallback to the hardcoded date-specific model.
 
-Session settings are configured in `server.py` during `session.update`.
+---
 
-## Requirements
+## Service Configuration
 
-### System
+Systemd unit: `translation-server.service`
 
-- Linux server with Python 3.10+
-- Asterisk with AudioSocket enabled
-- Asterisk AMI enabled
-- network access to OpenAI realtime websocket APIs
-
-### Python packages
-
-- `websockets`
-- `soxr`
-- `numpy`
-
-Install example:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install websockets soxr numpy
+```
+WorkingDirectory: /opt/translation-server
+ExecStart: /opt/translation-server/venv/bin/python /opt/translation-server/server.py
+EnvironmentFile: /etc/translation-server.env
+User: deploy
 ```
 
-## Configuration
-
-The server currently reads:
-
-- `OPENAI_API_KEY` from the environment
-
-Hard-coded values in `server.py`:
-
-- `HOST`, `PORT`
-- `AMI_HOST`, `AMI_PORT`
-- `AMI_USER`, `AMI_SECRET`
-- `OPENAI_MODEL`
-
-If you want this to be easier to deploy across environments, the next cleanup would be to move AMI credentials, bind address, and model selection into environment variables or a config file.
-
-## Running the Server
-
-Local run:
-
-```bash
-python3 server.py
-```
-
-The server listens on:
-
-```text
-127.0.0.1:5001
-```
-
-Typical production deployment uses a `systemd` service such as:
-
+Restart/check:
 ```bash
 systemctl restart translation-server
 journalctl -u translation-server -f
 ```
 
-## Logging
+Logs also written to `/var/log/translation-server.log`.
 
-Logs are written to:
+Metrics logged every 60 s: `played`, `filtered`, `dupes`. If `played=0` across multiple calls, translation audio is not reaching the callee.
 
-- stdout
-- `/var/log/translation-server.log`
+---
 
-Typical log events include:
+## Requirements
 
-- new connections and UUID detection
-- caller or callee role assignment
-- AMI originate attempts
-- prompt cache creation
-- speech detection
-- local silence commits
-- original transcripts
-- translated transcripts
-- filtered outputs
-- queue replay behavior
-- cleanup and periodic metrics
+### System
+- Python 3.10+
+- Asterisk with AudioSocket (`app_audiosocket.so`, `res_audiosocket.so`)
+- Asterisk AMI enabled with `[translation]` user
+- Network access to `wss://api.openai.com`
 
-Metrics currently logged every 60 seconds:
+### Python packages
+```
+websockets
+soxr
+numpy
+```
 
-- `played`
-- `filtered`
-- `dupes`
+---
 
-## Current Production Behavior
+## Asterisk Configuration
 
-The active implementation in `server.py` assumes:
+### pjsip.conf — VoipNow endpoints
 
-- caller language is English
-- callee language is determined from the destination number
-- both directions use separate realtime sessions
-- translation should be literal, not conversational
-- damaged or missing ASR should prefer dropping an utterance over inventing a sentence
+```ini
+[voipnow-auth]
+type=auth
+auth_type=userpass
+username=asterisk-bridge
+password=Bridge2024Secure!
 
-## Known Limitations
+[voipnow-aor]
+type=aor
+contact=sip:89.38.54.13:5060
 
-- The caller source language is currently fixed to English.
-- Some recovery logic still depends on event ordering from the Realtime API.
-- Post-filtering happens after transcript events, so it reduces bad output a lot but cannot guarantee zero audible hallucinations in every edge case.
-- Credentials and several deployment settings are still hard-coded in `server.py`.
+[voipnow]
+type=endpoint
+transport=transport-udp
+context=from-voipnow
+disallow=all
+allow=ulaw
+allow=alaw
+direct_media=no
+aors=voipnow-aor
 
-## Recommended Next Improvements
+[voipnow-identify]
+type=identify
+endpoint=voipnow
+match=89.38.54.13
+```
 
-If you keep evolving this service, the highest-value next steps are:
+### extensions.conf — from-voipnow context
 
-1. Move configuration into environment variables
-2. Add a text-first translation mode for ultra-high-risk utterances
-3. Add structured integration tests around replay, duplicate filtering, and active-response races
-4. Split `server.py` into modules for call control, OpenAI bridge logic, filtering, and configuration
-5. Add a deployment section with full Asterisk dialplan and service unit examples
+```
+[from-voipnow]
+exten => _X.,1,NoOp(=== Translation Call Started ===)
+ same => n,Set(DEST_NUMBER=${EXTEN})
+ same => n,Set(CALLER_UUID=${SHELL(uuidgen | tr -d '\n')})
+ same => n,Set(CALLEE_UUID=${SHELL(uuidgen | tr -d '\n')})
+ same => n,Set(REAL_CALLERID=${CALLERID(num)})
+ same => n,Progress()
+ same => n,Answer()
+ same => n,System(echo "${CALLER_UUID} ${CALLEE_UUID} ${DEST_NUMBER} ${REAL_CALLERID}" > /tmp/call_${CALLER_UUID}.txt)
+ same => n,AudioSocket(${CALLER_UUID},127.0.0.1:5001)
+ same => n,Hangup()
 
-## Summary
+[callee-audiosocket]
+exten => s,1,Answer()
+ same => n,AudioSocket(${CALLEE_UUID},127.0.0.1:5001)
+ same => n,Hangup()
+```
 
-This repository is a realtime bilingual phone bridge, not a general assistant. The important parts of the design are:
+Note: VoipNow strips the `888` prefix before forwarding to Asterisk, so `${EXTEN}` in the dialplan receives the bare destination number (no `888` prefix). Do not add prefix-stripping here.
 
-- low-latency audio conversion between Asterisk and OpenAI
-- strict prompting to keep translations literal
-- queueing and replay so speech is not lost during TTS
-- guards against empty commits and overlapping responses
-- cleanup of prior conversation state to reduce hallucinated carry-over
+### manager.conf — AMI user
 
-If you are debugging weird translations, start with these three files in order:
+```ini
+[translation]
+secret=TrServer2024!
+deny=0.0.0.0/0.0.0.0
+permit=127.0.0.1/255.255.255.255
+read=all
+write=all
+```
 
-1. `server.py`
-2. `prompt.md`
-3. `languages.py`
+---
+
+## Known Issues
+
+- Caller source language is fixed to English; callee language auto-detected from destination prefix
+- `AMI_SECRET` hardcoded in `server.py` as `"TrServer2024!"` — should be moved to env var
+- `OPENAI_MODEL` default is a date-specific model ID — if the model is deprecated by OpenAI, add `OPENAI_MODEL=gpt-4o-realtime-preview` to `/etc/translation-server.env` as an override
+- Response watchdog fires at 8s; if OpenAI is consistently slow to finalize (seen in logs), consider lowering to 5s — but test first to ensure long translations still complete
