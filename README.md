@@ -101,7 +101,7 @@ nc -z 127.0.0.1 5001 && echo 'port open' || echo 'port closed'
 ```bash
 # Check if AMI user exists and password matches
 grep -A5 '\[translation\]' /etc/asterisk/manager.conf
-# Compare with AMI_SECRET in server.py (hardcoded: "TrServer2024!")
+# Compare with AMI_SECRET in /etc/translation-server.env
 
 # Check if DIDLogic is registered
 asterisk -rx "pjsip show registrations"
@@ -317,8 +317,8 @@ numpy
 type=auth
 auth_type=userpass
 username=asterisk-bridge
-password=Bridge2024Secure!
-
+password=<your-password>
+be
 [voipnow-aor]
 type=aor
 contact=sip:89.38.54.13:5060
@@ -366,7 +366,7 @@ Note: VoipNow strips the `888` prefix before forwarding to Asterisk, so `${EXTEN
 
 ```ini
 [translation]
-secret=TrServer2024!
+secret=<from-env-AMI_SECRET>
 deny=0.0.0.0/0.0.0.0
 permit=127.0.0.1/255.255.255.255
 read=all
@@ -378,6 +378,6 @@ write=all
 ## Known Issues
 
 - Caller source language is fixed to English; callee language auto-detected from destination prefix
-- `AMI_SECRET` hardcoded in `server.py` as `"TrServer2024!"` — should be moved to env var
+- `AMI_SECRET` loaded from `/etc/translation-server.env` (fixed 2026-05-05)
 - `OPENAI_MODEL` default is a date-specific model ID — if the model is deprecated by OpenAI, add `OPENAI_MODEL=gpt-4o-realtime-preview` to `/etc/translation-server.env` as an override
 - Response watchdog fires at 8s; if OpenAI is consistently slow to finalize (seen in logs), consider lowering to 5s — but test first to ensure long translations still complete

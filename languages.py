@@ -15,7 +15,6 @@ COUNTRY_LANGUAGES = {
     "975": "Dzongkha",
     "591": "Spanish",  # Bolivia
     "387": "Bosnian",
-    "267": "English",  # Botswana
     "55":  "Portuguese",
     "673": "Malay",
     "359": "Bulgarian",
